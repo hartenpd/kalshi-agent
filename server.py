@@ -20,7 +20,7 @@ from mcp.server.fastmcp import FastMCP
 from kalshi_python_sync import Configuration, KalshiClient
 from kalshi_python_sync.models.market import Market as _MarketModel
 from kalshi_python_sync.models.orderbook import Orderbook as _OrderbookModel
-from kalshi_python_sync.models.create_order_request import CreateOrderRequest
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -911,8 +911,9 @@ def place_order(
             # Market order — no price needed
             order_kwargs["type"] = "market"
 
-        order_request = CreateOrderRequest(**order_kwargs)
-        response = client.create_order(order_request)
+        # SDK's create_order() takes **kwargs and builds the
+        # CreateOrderRequest internally — don't pass an object.
+        response = client.create_order(**order_kwargs)
         order = response.order
 
         # Log the successful submission
