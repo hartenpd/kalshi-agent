@@ -13,7 +13,7 @@ import os
 import math
 import sqlite3
 import certifi
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from collections import defaultdict
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -42,6 +42,14 @@ def _patched_market_from_dict(cls, obj):
             obj["category"] = ""
         if obj.get("risk_limit_cents") is None:
             obj["risk_limit_cents"] = 0
+        # The API returns enum values the SDK doesn't know about.
+        # Map unknown values to safe defaults so Pydantic doesn't crash.
+        _known_statuses = {"initialized", "active", "closed", "settled", "determined"}
+        if obj.get("status") and obj["status"] not in _known_statuses:
+            obj["status"] = "settled"
+        _known_results = {"yes", "no", ""}
+        if obj.get("result") is not None and obj["result"] not in _known_results:
+            obj["result"] = ""
     return _original_market_from_dict(cls, obj)
 
 
@@ -334,19 +342,8 @@ mcp = FastMCP("kalshi-agent")
 
 # ─── Market Discovery ────────────────────────────────────────────────────────
 
-def _fetch_series_markets(
-    client,
-    series_ticker: str,
-    max_close_ts: int | None = None,
-) -> list:
-    """
-    Fetch open markets for a series ticker, with optional close-date filter.
-
-    Args:
-        series_ticker: e.g. 'KXNBAGAME'
-        max_close_ts: Unix timestamp — only return markets closing before this.
-                      Use this to filter to "today/upcoming" games.
-    """
+def _fetch_series_markets(client, series_ticker: str) -> list:
+    """Fetch all open markets for a given series ticker, paginating."""
     all_markets = []
     cursor = None
     for _ in range(5):
@@ -355,8 +352,6 @@ def _fetch_series_markets(
             "status": "open",
             "limit": 200,
         }
-        if max_close_ts:
-            kwargs["max_close_ts"] = max_close_ts
         if cursor:
             kwargs["cursor"] = cursor
         resp = client.get_markets(**kwargs)
@@ -400,8 +395,7 @@ def get_sports_markets(query: str) -> str:
     Results are grouped by game matchup (e.g. 'Charlotte at Sacramento')
     with individual market tickers and prices shown underneath.
 
-    For league searches, results are filtered to games closing within
-    the next 3 days so you see today's and upcoming games first.
+    For league searches, all currently open/active markets are returned.
     """
     try:
         client = get_client()
@@ -410,37 +404,20 @@ def get_sports_markets(query: str) -> str:
         query_lower = query.lower()
         is_league_query = query.upper().strip() in SPORTS_SERIES.values()
 
-        # For league queries, filter to markets closing within 3 days
-        # so you see today's games, not stuff weeks away.
-        max_close_ts = None
-        if is_league_query:
-            cutoff = datetime.now(timezone.utc) + timedelta(days=3)
-            max_close_ts = int(cutoff.timestamp())
-
-        # Step 1: Fetch markets from the targeted series.
-        # This is the primary search path — finds simple game markets
-        # (Team A vs Team B) that the old text-only search missed.
+        # Step 1: Fetch open markets from the targeted series.
+        # No date filter — Kalshi sets close times ~2 weeks after the
+        # actual game date, so date filtering breaks everything.
+        # The status="open" filter in _fetch_series_markets already
+        # limits results to active/tradeable markets only.
         series_markets = []
         for series_ticker in target_series:
             try:
-                markets = _fetch_series_markets(
-                    client, series_ticker, max_close_ts
-                )
+                markets = _fetch_series_markets(client, series_ticker)
                 series_markets.extend(markets)
             except Exception:
                 pass
 
-        # Step 2: If we got 0 results from series AND it was a league
-        # query, retry without the date filter (maybe no games today).
-        if is_league_query and not series_markets and max_close_ts:
-            for series_ticker in target_series:
-                try:
-                    markets = _fetch_series_markets(client, series_ticker)
-                    series_markets.extend(markets)
-                except Exception:
-                    pass
-
-        # Step 3: For non-league queries, also search the general market
+        # Step 2: For non-league queries, also search the general market
         # list (catches parlays and other market types like KXMVE).
         general_matches = []
         if not is_league_query:
@@ -515,11 +492,10 @@ def get_sports_markets(query: str) -> str:
         total_markets = len(matches)
         total_games = len(games)
 
-        # Header shows what we searched and the date window
-        if is_league_query and max_close_ts:
+        if is_league_query:
             header = (
                 f"Found {total_markets} market(s) across {total_games} "
-                f"game(s) for {query.upper()} (next 3 days):\n"
+                f"game(s) for {query.upper()}:\n"
             )
         else:
             header = (
@@ -528,8 +504,19 @@ def get_sports_markets(query: str) -> str:
             )
         lines = [header]
 
+        # Sort games by earliest game date (extracted from ticker).
+        # Ticker format: KXNBAGAME-26MAR11CLEORL-CLE → "26MAR11"
+        # This puts today's games first, then tomorrow's, etc.
+        def _game_sort_key(event_ticker_and_markets):
+            first_ticker = event_ticker_and_markets[1][0].ticker
+            parts = first_ticker.split("-")
+            # The date code is in the 2nd segment, e.g. "26MAR11CLEORL"
+            return parts[1] if len(parts) > 1 else first_ticker
+
         shown_games = 0
-        for event_ticker, game_markets in games.items():
+        for event_ticker, game_markets in sorted(
+            games.items(), key=lambda kv: _game_sort_key(kv)
+        ):
             if shown_games >= 15:
                 break
             shown_games += 1
