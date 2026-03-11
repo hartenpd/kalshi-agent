@@ -49,9 +49,18 @@ Read `KALSHI_ENV` from `.env` to choose which one. Default to **demo**.
 - **calculate_bet_size** — quarter-Kelly criterion bet sizing
 - **get_performance_report** — win rate, ROI, P&L breakdown by sport
 
+### Analyst Pick Tracking
+- **log_analyst_pick** — log a pick from any analyst (NBA, MLS, EPL, etc.)
+- **settle_analyst_pick** — settle a pick after the game (win/loss/push)
+- **get_calibration_report** — predicted vs actual win rates by confidence level and sport
+
 ### System
 - **toggle_kill_switch** — emergency stop for all trading
 - **get_system_status** — shows kill switch state, daily P&L, trades today
+
+## Analyst Pick Logging
+
+**IMPORTANT:** Call `log_analyst_pick` for EVERY pick from any analyst MCP server — not just picks we decide to trade. This includes picks where we found no Kalshi market, picks with negative edge, and picks we passed on. The calibration report needs the full dataset (including untraded picks) to detect overconfidence, sport-level biases, and whether the edge calculation is actually predictive.
 
 ## Safety Rules
 

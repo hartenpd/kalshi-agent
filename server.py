@@ -160,6 +160,27 @@ def _init_db():
         )
     """)
 
+    # Analyst picks — logs every pick from any analyst MCP server,
+    # whether or not we actually trade it. Used for calibration tracking.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS analyst_picks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+            sport TEXT NOT NULL,              -- 'NBA', 'MLS', 'EPL', etc.
+            game TEXT NOT NULL,               -- 'Cleveland at Orlando'
+            game_date TEXT NOT NULL,           -- '2026-03-11'
+            pick TEXT NOT NULL,               -- 'Cleveland' or 'home'
+            confidence INTEGER NOT NULL,      -- 1-5 stars
+            model_probability REAL NOT NULL,  -- 0.70
+            market_price INTEGER,             -- Kalshi price in cents, NULL if no market
+            edge REAL,                        -- calculated edge, NULL if no market
+            bet_placed INTEGER NOT NULL DEFAULT 0,  -- 0 or 1
+            bet_amount REAL,                  -- dollars, NULL if no bet
+            outcome TEXT NOT NULL DEFAULT 'pending', -- 'win', 'loss', 'push', 'pending'
+            pnl REAL                          -- profit/loss in dollars, NULL until settled
+        )
+    """)
+
     # Kill switch defaults to ON (locked) — safe by default.
     # INSERT OR IGNORE means this only runs on first database creation,
     # it won't overwrite if the user has already toggled it.
@@ -1262,6 +1283,309 @@ def get_performance_report() -> str:
                 else event_name[:37] + "..."
             )
             lines.append(f"  {truncated}: {count} trade(s)")
+
+    return "\n".join(lines)
+
+
+# ─── Analyst Pick Tracking ────────────────────────────────────────────────────
+
+@mcp.tool()
+def log_analyst_pick(
+    sport: str,
+    game: str,
+    game_date: str,
+    pick: str,
+    confidence: int,
+    model_probability: float,
+    market_price: int | None = None,
+    edge: float | None = None,
+    bet_placed: bool = False,
+    bet_amount: float | None = None,
+) -> str:
+    """
+    Log a pick from any analyst to the calibration tracker.
+
+    Call this for EVERY pick — not just ones we trade. This builds
+    the dataset needed for calibration analysis (predicted vs actual).
+
+    Args:
+        sport: League name — 'NBA', 'MLS', 'EPL', 'NHL', etc.
+        game: Matchup description — 'Cleveland at Orlando'
+        game_date: Date of the game — '2026-03-11'
+        pick: Which side — 'Cleveland', 'home', 'Over 220.5', etc.
+        confidence: Analyst confidence 1-5 stars
+        model_probability: Model's estimated win probability (e.g. 0.70)
+        market_price: Kalshi market price in cents (e.g. 55). None if no market found.
+        edge: Calculated edge as decimal (e.g. 0.15). None if no market.
+        bet_placed: Whether we actually placed a trade on this pick
+        bet_amount: How much we bet in dollars. None if no bet.
+
+    Outcome defaults to 'pending' — use settle_analyst_pick after the game.
+    """
+    if not (1 <= confidence <= 5):
+        return "Error: confidence must be between 1 and 5."
+    if not (0 < model_probability < 1):
+        return "Error: model_probability must be between 0 and 1."
+
+    conn = _get_db()
+    cursor = conn.execute(
+        """
+        INSERT INTO analyst_picks
+            (sport, game, game_date, pick, confidence, model_probability,
+             market_price, edge, bet_placed, bet_amount, outcome)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        """,
+        (
+            sport.upper(),
+            game,
+            game_date,
+            pick,
+            confidence,
+            model_probability,
+            market_price,
+            edge,
+            1 if bet_placed else 0,
+            bet_amount,
+        ),
+    )
+    pick_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    edge_str = f"{edge * 100:+.1f}%" if edge is not None else "N/A"
+    market_str = f"{market_price}¢" if market_price is not None else "no market"
+    bet_str = f"${bet_amount:.2f}" if bet_amount else "no bet"
+
+    return (
+        f"Pick #{pick_id} logged.\n\n"
+        f"  Sport:       {sport.upper()}\n"
+        f"  Game:        {game}\n"
+        f"  Date:        {game_date}\n"
+        f"  Pick:        {pick}\n"
+        f"  Confidence:  {'★' * confidence}{'☆' * (5 - confidence)}\n"
+        f"  Model prob:  {model_probability:.0%}\n"
+        f"  Market:      {market_str}\n"
+        f"  Edge:        {edge_str}\n"
+        f"  Bet:         {bet_str}\n"
+        f"  Outcome:     pending"
+    )
+
+
+@mcp.tool()
+def settle_analyst_pick(pick_id: int, outcome: str) -> str:
+    """
+    Settle a pick after the game is played.
+
+    Args:
+        pick_id: ID of the pick to settle (from log_analyst_pick)
+        outcome: 'win', 'loss', or 'push'
+
+    Calculates P&L automatically if a bet was placed:
+      - Win:  profit = bet_amount × (1 / market_probability - 1)
+      - Loss: profit = -bet_amount
+      - Push: profit = 0
+    """
+    outcome = outcome.lower().strip()
+    if outcome not in ("win", "loss", "push"):
+        return "Error: outcome must be 'win', 'loss', or 'push'."
+
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT * FROM analyst_picks WHERE id = ?", (pick_id,)
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        return f"Error: pick #{pick_id} not found."
+
+    if row["outcome"] != "pending":
+        conn.close()
+        return (
+            f"Pick #{pick_id} is already settled as '{row['outcome']}'. "
+            f"No changes made."
+        )
+
+    # Calculate P&L if a bet was placed
+    pnl = None
+    if row["bet_placed"] and row["bet_amount"]:
+        if outcome == "win":
+            # Payout is $1 per contract, cost was market_price cents
+            # Profit = payout - cost. For bet_amount dollars at market_price:
+            # contracts = bet_amount / (market_price / 100)
+            # profit = contracts * (1 - market_price/100)
+            if row["market_price"] and row["market_price"] > 0:
+                market_frac = row["market_price"] / 100
+                pnl = row["bet_amount"] * (1 / market_frac - 1)
+            else:
+                # No market price recorded — estimate from model
+                pnl = row["bet_amount"] * (1 / row["model_probability"] - 1)
+        elif outcome == "loss":
+            pnl = -row["bet_amount"]
+        else:  # push
+            pnl = 0.0
+
+        # Round to 2 decimal places
+        pnl = round(pnl, 2)
+
+    conn.execute(
+        "UPDATE analyst_picks SET outcome = ?, pnl = ? WHERE id = ?",
+        (outcome, pnl, pick_id),
+    )
+    conn.commit()
+    conn.close()
+
+    pnl_str = f"${pnl:+,.2f}" if pnl is not None else "N/A (no bet)"
+
+    return (
+        f"Pick #{pick_id} settled.\n\n"
+        f"  Game:     {row['game']}\n"
+        f"  Pick:     {row['pick']}\n"
+        f"  Outcome:  {outcome.upper()}\n"
+        f"  P&L:      {pnl_str}"
+    )
+
+
+@mcp.tool()
+def get_calibration_report() -> str:
+    """
+    Calibration report: how accurate are the analyst's predictions?
+
+    Groups all settled picks by sport and confidence level, then shows:
+      - Predicted probability vs actual win rate
+      - Whether positive-edge bets were actually profitable
+      - Breakdown by sport
+      - Sample size for each bucket
+
+    This is the key tool for improving predictions over time.
+    Needs at least a few settled picks to be useful.
+    """
+    conn = _get_db()
+
+    # Get all settled picks (not pending)
+    rows = conn.execute(
+        """
+        SELECT * FROM analyst_picks
+        WHERE outcome IN ('win', 'loss', 'push')
+        ORDER BY game_date DESC
+        """
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return (
+            "No settled picks yet. Use settle_analyst_pick after games "
+            "finish to build calibration data."
+        )
+
+    total = len(rows)
+    wins = sum(1 for r in rows if r["outcome"] == "win")
+    losses = sum(1 for r in rows if r["outcome"] == "loss")
+    pushes = sum(1 for r in rows if r["outcome"] == "push")
+    win_rate = wins / (wins + losses) if (wins + losses) > 0 else 0
+
+    # Overall P&L from bets that were actually placed
+    bets = [r for r in rows if r["bet_placed"] and r["pnl"] is not None]
+    total_pnl = sum(r["pnl"] for r in bets)
+    total_wagered = sum(r["bet_amount"] for r in bets if r["bet_amount"])
+    roi = (total_pnl / total_wagered * 100) if total_wagered > 0 else 0
+
+    lines = [
+        "═══ Calibration Report ═══\n",
+        f"Total settled picks:  {total}  ({wins}W / {losses}L / {pushes}P)",
+        f"Overall win rate:     {win_rate:.0%}",
+    ]
+    if bets:
+        lines.extend([
+            f"Bets placed:         {len(bets)}",
+            f"Total wagered:       ${total_wagered:,.2f}",
+            f"Total P&L:           ${total_pnl:+,.2f}",
+            f"ROI:                 {roi:+.1f}%",
+        ])
+
+    # ── Calibration by confidence level ──────────────────────────────
+    lines.append("\n── Calibration by Confidence ──")
+    lines.append(f"  {'Stars':<8} {'Picks':>5}  {'Win%':>5}  {'Avg Model':>10}  {'Verdict'}")
+
+    for stars in range(5, 0, -1):
+        bucket = [r for r in rows if r["confidence"] == stars]
+        if not bucket:
+            continue
+        n = len(bucket)
+        bucket_wins = sum(1 for r in bucket if r["outcome"] == "win")
+        bucket_wl = sum(1 for r in bucket if r["outcome"] in ("win", "loss"))
+        actual_wr = bucket_wins / bucket_wl if bucket_wl > 0 else 0
+        avg_model = sum(r["model_probability"] for r in bucket) / n
+
+        # Compare predicted vs actual to check calibration
+        diff = actual_wr - avg_model
+        if abs(diff) < 0.05:
+            verdict = "well calibrated"
+        elif diff > 0:
+            verdict = f"underconfident by {abs(diff):.0%}"
+        else:
+            verdict = f"overconfident by {abs(diff):.0%}"
+
+        star_str = '★' * stars + '☆' * (5 - stars)
+        lines.append(
+            f"  {star_str} {n:>5}  {actual_wr:>5.0%}  {avg_model:>10.0%}  {verdict}"
+        )
+
+    # ── Breakdown by sport ───────────────────────────────────────────
+    sports: dict[str, list] = defaultdict(list)
+    for r in rows:
+        sports[r["sport"]].append(r)
+
+    if len(sports) > 1:
+        lines.append("\n── Breakdown by Sport ──")
+        lines.append(f"  {'Sport':<6} {'Picks':>5}  {'Win%':>5}  {'Avg Model':>10}  {'P&L':>8}")
+
+        for sport in sorted(sports.keys()):
+            s_rows = sports[sport]
+            s_n = len(s_rows)
+            s_wins = sum(1 for r in s_rows if r["outcome"] == "win")
+            s_wl = sum(1 for r in s_rows if r["outcome"] in ("win", "loss"))
+            s_wr = s_wins / s_wl if s_wl > 0 else 0
+            s_avg_model = sum(r["model_probability"] for r in s_rows) / s_n
+            s_bets = [r for r in s_rows if r["bet_placed"] and r["pnl"] is not None]
+            s_pnl = sum(r["pnl"] for r in s_bets)
+            lines.append(
+                f"  {sport:<6} {s_n:>5}  {s_wr:>5.0%}  {s_avg_model:>10.0%}  ${s_pnl:>+7,.2f}"
+            )
+
+    # ── Edge accuracy ────────────────────────────────────────────────
+    edge_picks = [r for r in rows if r["edge"] is not None]
+    if edge_picks:
+        pos_edge = [r for r in edge_picks if r["edge"] > 0]
+        neg_edge = [r for r in edge_picks if r["edge"] <= 0]
+
+        lines.append("\n── Edge Accuracy ──")
+
+        if pos_edge:
+            pe_wins = sum(1 for r in pos_edge if r["outcome"] == "win")
+            pe_wl = sum(1 for r in pos_edge if r["outcome"] in ("win", "loss"))
+            pe_wr = pe_wins / pe_wl if pe_wl > 0 else 0
+            pe_bets = [r for r in pos_edge if r["bet_placed"] and r["pnl"] is not None]
+            pe_pnl = sum(r["pnl"] for r in pe_bets)
+            lines.append(
+                f"  Positive edge picks: {len(pos_edge)} "
+                f"({pe_wr:.0%} win rate, ${pe_pnl:+,.2f} P&L)"
+            )
+
+        if neg_edge:
+            ne_wins = sum(1 for r in neg_edge if r["outcome"] == "win")
+            ne_wl = sum(1 for r in neg_edge if r["outcome"] in ("win", "loss"))
+            ne_wr = ne_wins / ne_wl if ne_wl > 0 else 0
+            lines.append(
+                f"  Negative edge picks: {len(neg_edge)} "
+                f"({ne_wr:.0%} win rate — should be avoided)"
+            )
+
+    # ── Tip ──────────────────────────────────────────────────────────
+    if total < 20:
+        lines.append(
+            f"\n⚠ Small sample size ({total} picks). "
+            f"Need 20+ settled picks for meaningful calibration."
+        )
 
     return "\n".join(lines)
 
