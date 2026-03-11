@@ -13,7 +13,7 @@ import os
 import math
 import sqlite3
 import certifi
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
@@ -89,6 +89,19 @@ API_URL = API_URLS.get(KALSHI_ENV, API_URLS["demo"])
 
 # Path to the local SQLite database — lives next to server.py
 DB_PATH = os.path.join(os.path.dirname(__file__), "kalshi_agent.db")
+
+# Known sports game series on Kalshi (uppercase required by API).
+# Maps series ticker → (league abbreviation, team search keywords).
+# These are "simple game" markets (Team A vs Team B), not parlays.
+SPORTS_SERIES = {
+    "KXNBAGAME": "NBA",
+    "KXMLSGAME": "MLS",
+    "KXNHLGAME": "NHL",
+    "KXEPLGAME": "EPL",
+    "KXMLBGAME": "MLB",
+    "KXNFLGAME": "NFL",
+    "KXUCLGAME": "UCL",
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -321,6 +334,58 @@ mcp = FastMCP("kalshi-agent")
 
 # ─── Market Discovery ────────────────────────────────────────────────────────
 
+def _fetch_series_markets(
+    client,
+    series_ticker: str,
+    max_close_ts: int | None = None,
+) -> list:
+    """
+    Fetch open markets for a series ticker, with optional close-date filter.
+
+    Args:
+        series_ticker: e.g. 'KXNBAGAME'
+        max_close_ts: Unix timestamp — only return markets closing before this.
+                      Use this to filter to "today/upcoming" games.
+    """
+    all_markets = []
+    cursor = None
+    for _ in range(5):
+        kwargs = {
+            "series_ticker": series_ticker,
+            "status": "open",
+            "limit": 200,
+        }
+        if max_close_ts:
+            kwargs["max_close_ts"] = max_close_ts
+        if cursor:
+            kwargs["cursor"] = cursor
+        resp = client.get_markets(**kwargs)
+        all_markets.extend(resp.markets)
+        cursor = resp.cursor
+        if not cursor:
+            break
+    return all_markets
+
+
+def _resolve_query_to_series(query: str) -> list[str]:
+    """
+    Map a search query to the right series tickers.
+
+    If the query is a league name (e.g. 'NBA', 'MLS'), return that
+    specific series. Otherwise return ALL sports series so we can
+    text-search across them.
+    """
+    q = query.upper().strip()
+
+    # Direct league name match → just that one series
+    for series_ticker, league in SPORTS_SERIES.items():
+        if q == league:
+            return [series_ticker]
+
+    # Return all series for team/player text search
+    return list(SPORTS_SERIES.keys())
+
+
 @mcp.tool()
 def get_sports_markets(query: str) -> str:
     """
@@ -329,47 +394,111 @@ def get_sports_markets(query: str) -> str:
     Search by team name (e.g. 'Charlotte', 'Denver', 'Arsenal'), player name
     (e.g. 'Jokic', 'Harden'), or game terms (e.g. 'Over', 'goals', 'Points').
 
+    You can also search by league name to get all upcoming games:
+      NBA, MLS, NHL, EPL, MLB, NFL, UCL
+
     Results are grouped by game matchup (e.g. 'Charlotte at Sacramento')
     with individual market tickers and prices shown underneath.
 
-    Note: Kalshi sports markets don't use league names like 'NBA' in their
-    titles. Search by team or player name instead.
+    For league searches, results are filtered to games closing within
+    the next 3 days so you see today's and upcoming games first.
     """
     try:
         client = get_client()
 
-        all_markets = []
-        cursor = None
-
-        for _ in range(3):
-            kwargs = {"status": "open", "limit": 200}
-            if cursor:
-                kwargs["cursor"] = cursor
-            response = client.get_markets(**kwargs)
-            all_markets.extend(response.markets)
-            cursor = response.cursor
-            if not cursor:
-                break
-
+        target_series = _resolve_query_to_series(query)
         query_lower = query.lower()
-        matches = [
-            m for m in all_markets
-            if query_lower in (m.title or "").lower()
-            or query_lower in (m.subtitle or "").lower()
-            or query_lower in (m.event_ticker or "").lower()
-        ]
+        is_league_query = query.upper().strip() in SPORTS_SERIES.values()
+
+        # For league queries, filter to markets closing within 3 days
+        # so you see today's games, not stuff weeks away.
+        max_close_ts = None
+        if is_league_query:
+            cutoff = datetime.now(timezone.utc) + timedelta(days=3)
+            max_close_ts = int(cutoff.timestamp())
+
+        # Step 1: Fetch markets from the targeted series.
+        # This is the primary search path — finds simple game markets
+        # (Team A vs Team B) that the old text-only search missed.
+        series_markets = []
+        for series_ticker in target_series:
+            try:
+                markets = _fetch_series_markets(
+                    client, series_ticker, max_close_ts
+                )
+                series_markets.extend(markets)
+            except Exception:
+                pass
+
+        # Step 2: If we got 0 results from series AND it was a league
+        # query, retry without the date filter (maybe no games today).
+        if is_league_query and not series_markets and max_close_ts:
+            for series_ticker in target_series:
+                try:
+                    markets = _fetch_series_markets(client, series_ticker)
+                    series_markets.extend(markets)
+                except Exception:
+                    pass
+
+        # Step 3: For non-league queries, also search the general market
+        # list (catches parlays and other market types like KXMVE).
+        general_matches = []
+        if not is_league_query:
+            general_markets = []
+            cursor = None
+            for _ in range(3):
+                kwargs = {"status": "open", "limit": 200}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                response = client.get_markets(**kwargs)
+                general_markets.extend(response.markets)
+                cursor = response.cursor
+                if not cursor:
+                    break
+            general_matches = [
+                m for m in general_markets
+                if query_lower in (m.title or "").lower()
+                or query_lower in (m.subtitle or "").lower()
+                or query_lower in (m.event_ticker or "").lower()
+                or query_lower in (m.ticker or "").lower()
+            ]
+
+        # Step 4: Combine and filter results.
+        if is_league_query:
+            # Series markets are already filtered by league — keep all
+            matches = list(series_markets)
+        else:
+            # Text-filter series markets, then add general matches
+            filtered_series = [
+                m for m in series_markets
+                if query_lower in (m.title or "").lower()
+                or query_lower in (m.subtitle or "").lower()
+                or query_lower in (m.event_ticker or "").lower()
+                or query_lower in (m.ticker or "").lower()
+            ]
+            matches = filtered_series + general_matches
+
+        # Deduplicate by ticker
+        seen = set()
+        unique_matches = []
+        for m in matches:
+            if m.ticker not in seen:
+                seen.add(m.ticker)
+                unique_matches.append(m)
+        matches = unique_matches
 
         if not matches:
+            leagues = ", ".join(SPORTS_SERIES.values())
             return (
                 f"No open markets found matching '{query}'.\n\n"
-                f"Tip: Kalshi sports markets use team/player names, not "
-                f"league names. Try searching for:\n"
-                f"  - Team names: 'Charlotte', 'Denver', 'Arsenal'\n"
-                f"  - Player names: 'Jokic', 'Harden', 'LeBron'\n"
-                f"  - Game terms: 'Over', 'goals', 'Points', 'wins'"
+                f"Tips:\n"
+                f"  - Search by league: {leagues}\n"
+                f"  - Search by team: 'Charlotte', 'Denver', 'Arsenal'\n"
+                f"  - Search by player: 'Jokic', 'Harden', 'LeBron'\n"
+                f"  - Game terms: 'Over', 'goals', 'Points'"
             )
 
-        # Group markets by game (event_ticker)
+        # Step 5: Group by game (event_ticker) and format output.
         games = defaultdict(list)
         for m in matches:
             games[m.event_ticker].append(m)
@@ -385,10 +514,19 @@ def get_sports_markets(query: str) -> str:
 
         total_markets = len(matches)
         total_games = len(games)
-        lines = [
-            f"Found {total_markets} market(s) across {total_games} "
-            f"game(s) matching '{query}':\n"
-        ]
+
+        # Header shows what we searched and the date window
+        if is_league_query and max_close_ts:
+            header = (
+                f"Found {total_markets} market(s) across {total_games} "
+                f"game(s) for {query.upper()} (next 3 days):\n"
+            )
+        else:
+            header = (
+                f"Found {total_markets} market(s) across {total_games} "
+                f"game(s) matching '{query}':\n"
+            )
+        lines = [header]
 
         shown_games = 0
         for event_ticker, game_markets in games.items():
@@ -412,7 +550,7 @@ def get_sports_markets(query: str) -> str:
                 )
                 lines.append(
                     f"  Ticker: {m.ticker}\n"
-                    f"  Legs:   {title}\n"
+                    f"  Title:  {title}\n"
                     f"  YES: ${yes_price:.2f}  |  NO: ${no_price:.2f}  |  "
                     f"Vol: {volume:,}  |  Closes: {close_str}\n"
                 )
