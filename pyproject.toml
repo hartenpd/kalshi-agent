@@ -1,0 +1,12 @@
+[project]
+name = "kalshi-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "certifi>=2026.2.25",
+    "kalshi-python-sync>=3.2.0",
+    "mcp[cli]>=1.26.0",
+    "python-dotenv>=1.2.2",
+]
