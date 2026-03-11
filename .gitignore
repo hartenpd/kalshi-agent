@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .venv/
 kalshi_agent.db
+dashboard.html
