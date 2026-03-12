@@ -21,6 +21,9 @@ from kalshi_python_sync import Configuration, KalshiClient
 from kalshi_python_sync.models.market import Market as _MarketModel
 from kalshi_python_sync.models.orderbook import Orderbook as _OrderbookModel
 from kalshi_python_sync.models.order import Order as _OrderModel
+from kalshi_python_sync.models.market_position import MarketPosition as _MarketPositionModel
+from kalshi_python_sync.models.event_position import EventPosition as _EventPositionModel
+from kalshi_python_sync.models.fill import Fill as _FillModel
 
 
 
@@ -132,6 +135,87 @@ def _patched_order_from_dict(cls, obj):
 
 
 _OrderModel.from_dict = _patched_order_from_dict
+
+# Patch 4: MarketPosition model — API returns null for int fields that now
+# have *_dollars string equivalents. Default nulls to 0 so Pydantic is happy.
+_original_position_from_dict = _MarketPositionModel.from_dict.__func__
+
+_POSITION_NUMERIC_DEFAULTS = {
+    "total_traded": 0, "position": 0, "market_exposure": 0,
+    "realized_pnl": 0, "resting_orders_count": 0, "fees_paid": 0,
+}
+_POSITION_STRING_DEFAULTS = {
+    "total_traded_dollars": "0.0000", "market_exposure_dollars": "0.0000",
+    "realized_pnl_dollars": "0.0000", "fees_paid_dollars": "0.0000",
+}
+
+
+@classmethod  # type: ignore[misc]
+def _patched_position_from_dict(cls, obj):
+    if isinstance(obj, dict):
+        for field, default in _POSITION_NUMERIC_DEFAULTS.items():
+            if obj.get(field) is None:
+                obj[field] = default
+        for field, default in _POSITION_STRING_DEFAULTS.items():
+            if obj.get(field) is None:
+                obj[field] = default
+    return _original_position_from_dict(cls, obj)
+
+
+_MarketPositionModel.from_dict = _patched_position_from_dict
+
+# Patch 4b: EventPosition model — same null-int pattern as MarketPosition.
+_original_event_position_from_dict = _EventPositionModel.from_dict.__func__
+
+_EVENT_POS_NUMERIC_DEFAULTS = {
+    "total_cost": 0, "total_cost_shares": 0, "event_exposure": 0,
+    "realized_pnl": 0, "fees_paid": 0,
+}
+_EVENT_POS_STRING_DEFAULTS = {
+    "total_cost_dollars": "0.0000", "event_exposure_dollars": "0.0000",
+    "realized_pnl_dollars": "0.0000", "fees_paid_dollars": "0.0000",
+}
+
+
+@classmethod  # type: ignore[misc]
+def _patched_event_position_from_dict(cls, obj):
+    if isinstance(obj, dict):
+        for field, default in _EVENT_POS_NUMERIC_DEFAULTS.items():
+            if obj.get(field) is None:
+                obj[field] = default
+        for field, default in _EVENT_POS_STRING_DEFAULTS.items():
+            if obj.get(field) is None:
+                obj[field] = default
+    return _original_event_position_from_dict(cls, obj)
+
+
+_EventPositionModel.from_dict = _patched_event_position_from_dict
+
+# Patch 5: Fill model — API returns null for int/float fields (count, price,
+# yes_price, no_price) that the SDK marks as required non-nullable.
+_original_fill_from_dict = _FillModel.from_dict.__func__
+
+_FILL_NUMERIC_DEFAULTS = {
+    "count": 0, "yes_price": 0, "no_price": 0, "price": 0,
+}
+_FILL_STRING_DEFAULTS = {
+    "yes_price_fixed": "0.0000", "no_price_fixed": "0.0000",
+}
+
+
+@classmethod  # type: ignore[misc]
+def _patched_fill_from_dict(cls, obj):
+    if isinstance(obj, dict):
+        for field, default in _FILL_NUMERIC_DEFAULTS.items():
+            if obj.get(field) is None:
+                obj[field] = default
+        for field, default in _FILL_STRING_DEFAULTS.items():
+            if obj.get(field) is None:
+                obj[field] = default
+    return _original_fill_from_dict(cls, obj)
+
+
+_FillModel.from_dict = _patched_fill_from_dict
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -814,8 +898,10 @@ def get_positions() -> str:
             # position > 0 means YES contracts, < 0 means NO contracts
             side = "YES" if p.position > 0 else "NO"
             qty = abs(p.position)
-            exposure = p.market_exposure / 100  # cents → dollars
-            pnl = p.realized_pnl / 100
+            # Prefer _dollars fields (always populated) over deprecated
+            # cents fields (now null from API, defaulted to 0 by our patch).
+            exposure = float(p.market_exposure_dollars)
+            pnl = float(p.realized_pnl_dollars)
 
             lines.append(
                 f"  {p.ticker}\n"
@@ -850,15 +936,19 @@ def get_order_history() -> str:
             if fills:
                 lines.append(f"Kalshi Fills (last {len(fills)}):\n")
                 for f in fills:
-                    price_cents = f.yes_price if f.side == "yes" else f.no_price
-                    price_dollars = price_cents / 100
+                    # Prefer _fixed dollar fields (always populated) over
+                    # deprecated cents fields (now null, defaulted to 0).
+                    price_str = (
+                        f.yes_price_fixed if f.side == "yes"
+                        else f.no_price_fixed
+                    )
                     time_str = (
                         str(f.created_time) if f.created_time else "N/A"
                     )
                     lines.append(
                         f"  {f.ticker}\n"
                         f"    {f.action.upper()} {f.count} {f.side.upper()} "
-                        f"@ ${price_dollars:.2f}  |  {time_str}\n"
+                        f"@ ${price_str}  |  {time_str}\n"
                     )
             else:
                 lines.append("Kalshi Fills: none yet\n")
@@ -999,67 +1089,104 @@ def place_order(
         )
 
     # ── All checks passed — build and send the order ─────────────────
-    try:
-        client = get_client()
+    #
+    # IMPORTANT: The API call and response parsing are separated so that
+    # if the HTTP request succeeds (order went through on Kalshi) but
+    # the SDK's Pydantic model fails to parse the response, we still
+    # log the trade as "submitted" — not "failed".  Only a genuine API
+    # error (4xx/5xx, network failure) should be logged as "failed".
 
-        order_kwargs = {
-            "ticker": ticker,
-            "side": side,
-            "action": "buy",
-            "count": quantity,
-        }
+    client = get_client()
 
-        if limit_price_cents is not None:
-            # Limit order — set the price on the correct side
-            order_kwargs["type"] = "limit"
-            if side == "yes":
-                order_kwargs["yes_price"] = limit_price_cents
-            else:
-                order_kwargs["no_price"] = limit_price_cents
+    order_kwargs = {
+        "ticker": ticker,
+        "side": side,
+        "action": "buy",
+        "count": quantity,
+    }
+
+    if limit_price_cents is not None:
+        # Limit order — set the price on the correct side
+        order_kwargs["type"] = "limit"
+        if side == "yes":
+            order_kwargs["yes_price"] = limit_price_cents
         else:
-            # Market order — no price needed
-            order_kwargs["type"] = "market"
+            order_kwargs["no_price"] = limit_price_cents
+    else:
+        # Market order — no price needed
+        order_kwargs["type"] = "market"
 
-        # SDK's create_order() takes **kwargs and builds the
-        # CreateOrderRequest internally — don't pass an object.
+    # ── Step 1: Send the order to Kalshi ────────────────────────────
+    # If this fails, the order never reached Kalshi → log as "failed".
+    try:
         response = client.create_order(**order_kwargs)
-        order = response.order
-
-        # Log the successful submission
-        _log_trade(
-            ticker=ticker,
-            side=side,
-            action="buy",
-            quantity=quantity,
-            price_cents=limit_price_cents or 0,
-            status="submitted",
-            order_id=order.order_id,
-        )
-
-        price_display = (
-            f"{limit_price_cents}¢" if limit_price_cents
-            else "market price"
-        )
-
-        return (
-            f"✅ Order submitted successfully!\n\n"
-            f"  Order ID:  {order.order_id}\n"
-            f"  Ticker:    {ticker}\n"
-            f"  Side:      {side.upper()}\n"
-            f"  Quantity:  {quantity} contract(s)\n"
-            f"  Price:     {price_display}\n"
-            f"  Status:    {order.status}\n\n"
-            f"Use get_order_history to track this order."
-        )
-
     except Exception as e:
-        # Log the failed attempt
         _log_trade(
             ticker=ticker, side=side, action="buy", quantity=quantity,
             price_cents=limit_price_cents or 0, status="failed",
             error_message=str(e),
         )
         return _format_error(f"placing order on '{ticker}'", e)
+
+    # ── Step 2: Parse the response ──────────────────────────────────
+    # If we get here, the API accepted the order (HTTP 2xx). The order
+    # went through regardless of whether the SDK can parse the response.
+    # Log as "submitted" even if parsing blows up.
+    try:
+        order = response.order
+        order_id = order.order_id
+        order_status = order.status
+    except Exception as parse_err:
+        # API succeeded but response parsing failed (Pydantic issues).
+        # Log as submitted with a warning — the order IS on Kalshi.
+        _log_trade(
+            ticker=ticker, side=side, action="buy", quantity=quantity,
+            price_cents=limit_price_cents or 0, status="submitted",
+            order_id="",
+            error_message=f"Order submitted but response parse failed: {parse_err}",
+        )
+
+        price_display = (
+            f"{limit_price_cents}¢" if limit_price_cents
+            else "market price"
+        )
+        return (
+            f"⚠️ Order submitted to Kalshi but response parsing failed.\n\n"
+            f"  Ticker:    {ticker}\n"
+            f"  Side:      {side.upper()}\n"
+            f"  Quantity:  {quantity} contract(s)\n"
+            f"  Price:     {price_display}\n\n"
+            f"  Parse error: {parse_err}\n\n"
+            f"The order likely went through. Use get_positions or "
+            f"reconcile_positions to verify."
+        )
+
+    # ── Happy path: API call + parsing both succeeded ───────────────
+    _log_trade(
+        ticker=ticker,
+        side=side,
+        action="buy",
+        quantity=quantity,
+        price_cents=limit_price_cents or 0,
+        status="submitted",
+        order_id=order_id,
+    )
+
+    price_display = (
+        f"{limit_price_cents}¢" if limit_price_cents
+        else "market price"
+    )
+
+    return (
+        f"✅ Order submitted successfully!\n\n"
+        f"  Order ID:  {order_id}\n"
+        f"  Ticker:    {ticker}\n"
+        f"  Side:      {side.upper()}\n"
+        f"  Quantity:  {quantity} contract(s)\n"
+        f"  Price:     {price_display}\n"
+        f"  Status:    {order_status}\n\n"
+        f"Use get_order_history to track this order."
+    )
 
 
 @mcp.tool()
@@ -1676,6 +1803,152 @@ def get_calibration_report() -> str:
         )
 
     return "\n".join(lines)
+
+
+# ─── Position Reconciliation ─────────────────────────────────────────────────
+
+@mcp.tool()
+def reconcile_positions() -> str:
+    """
+    Compare Kalshi's actual positions against the local SQLite trade log.
+
+    Flags mismatches:
+      - Positions on Kalshi that have no matching "submitted" trade locally
+      - Local trades logged as "failed" that actually filled on Kalshi
+      - Quantity or side discrepancies between Kalshi and the local log
+
+    Use this after suspected order issues (e.g. response parse failures)
+    to make sure your local records match reality.
+    """
+    try:
+        # ── Fetch real positions from Kalshi ────────────────────────────
+        client = get_client()
+        all_positions = []
+        cursor = None
+        for _ in range(5):
+            kwargs = {"limit": 100}
+            if cursor:
+                kwargs["cursor"] = cursor
+            response = client.get_positions(**kwargs)
+            all_positions.extend(response.market_positions)
+            cursor = response.cursor
+            if not cursor:
+                break
+
+        # Build a dict of active Kalshi positions: ticker → {side, qty, exposure}
+        kalshi_map: dict[str, dict] = {}
+        for p in all_positions:
+            if p.position == 0:
+                continue
+            kalshi_map[p.ticker] = {
+                "side": "yes" if p.position > 0 else "no",
+                "qty": abs(p.position),
+                "exposure": float(p.market_exposure_dollars),
+                "pnl": float(p.realized_pnl_dollars),
+            }
+
+        # ── Fetch local trade log ───────────────────────────────────────
+        conn = _get_db()
+        rows = conn.execute(
+            """
+            SELECT ticker, side, quantity, status, order_id, error_message
+            FROM trades
+            WHERE status IN ('submitted', 'filled', 'failed')
+            ORDER BY timestamp DESC
+            """
+        ).fetchall()
+        conn.close()
+
+        # Build a summary of local trades per ticker:
+        # net quantity submitted/filled per side
+        local_map: dict[str, dict] = {}
+        failed_tickers: dict[str, list] = {}
+        for r in rows:
+            t = r["ticker"]
+            if r["status"] in ("submitted", "filled"):
+                if t not in local_map:
+                    local_map[t] = {"side": r["side"], "qty": 0}
+                local_map[t]["qty"] += r["quantity"]
+            if r["status"] == "failed":
+                if t not in failed_tickers:
+                    failed_tickers[t] = []
+                failed_tickers[t].append({
+                    "qty": r["quantity"],
+                    "side": r["side"],
+                    "error": r["error_message"],
+                })
+
+        # ── Compare ─────────────────────────────────────────────────────
+        issues = []
+        matched = []
+
+        # Check every Kalshi position against local log
+        for ticker, kpos in kalshi_map.items():
+            lpos = local_map.get(ticker)
+            if lpos is None:
+                # Kalshi has it but local DB doesn't — ghost trade
+                issues.append(
+                    f"⚠ GHOST POSITION: {ticker}\n"
+                    f"    Kalshi: {kpos['qty']} {kpos['side'].upper()} "
+                    f"(${kpos['exposure']:,.2f} exposure)\n"
+                    f"    Local DB: no submitted/filled trades found\n"
+                )
+                # Check if it was logged as "failed"
+                if ticker in failed_tickers:
+                    for ft in failed_tickers[ticker]:
+                        issues.append(
+                            f"    → Found FAILED trade: {ft['qty']} "
+                            f"{ft['side'].upper()} — error: {ft['error']}\n"
+                            f"    → This trade likely went through despite "
+                            f"being logged as failed!\n"
+                        )
+            else:
+                # Both have it — check for discrepancies
+                if kpos["qty"] != lpos["qty"] or kpos["side"] != lpos["side"]:
+                    issues.append(
+                        f"⚠ MISMATCH: {ticker}\n"
+                        f"    Kalshi: {kpos['qty']} {kpos['side'].upper()}\n"
+                        f"    Local:  {lpos['qty']} {lpos['side'].upper()}\n"
+                    )
+                else:
+                    matched.append(
+                        f"  ✓ {ticker}: "
+                        f"{kpos['qty']} {kpos['side'].upper()} — matches"
+                    )
+
+        # Check for local submitted trades with no Kalshi position
+        # (could mean the order was cancelled or expired)
+        for ticker, lpos in local_map.items():
+            if ticker not in kalshi_map:
+                issues.append(
+                    f"⚠ LOCAL ONLY: {ticker}\n"
+                    f"    Local DB: {lpos['qty']} {lpos['side'].upper()} "
+                    f"(submitted/filled)\n"
+                    f"    Kalshi: no position found — may have been "
+                    f"cancelled, expired, or already settled\n"
+                )
+
+        # ── Build report ────────────────────────────────────────────────
+        lines = ["═══ Position Reconciliation ═══\n"]
+        lines.append(
+            f"Kalshi positions: {len(kalshi_map)}  |  "
+            f"Local submitted/filled: {len(local_map)}\n"
+        )
+
+        if issues:
+            lines.append(f"🚨 {len(issues)} issue(s) found:\n")
+            lines.extend(issues)
+        else:
+            lines.append("✅ No discrepancies found.\n")
+
+        if matched:
+            lines.append(f"\nMatched ({len(matched)}):")
+            lines.extend(matched)
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return _format_error("reconciling positions", e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
