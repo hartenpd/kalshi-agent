@@ -467,6 +467,35 @@ def get_client() -> KalshiClient:
     return _client
 
 
+class KillSwitchError(Exception):
+    """Raised when an order is attempted while the kill switch is ON."""
+    pass
+
+
+def _safe_create_order(**order_kwargs) -> object:
+    """
+    The ONLY function in this project that is allowed to call
+    client.create_order().  Every order placement MUST go through here.
+
+    Safety guarantee: re-checks the kill switch immediately before the
+    API call, closing the race-condition window between the tool-level
+    check and the actual HTTP request.
+
+    Raises:
+        KillSwitchError  – if the kill switch is ON
+        Exception        – any error from the Kalshi SDK / network
+    """
+    # Final kill-switch gate — this is the last line of defense.
+    if _is_kill_switch_on():
+        raise KillSwitchError(
+            "BLOCKED: Kill switch is ON at the moment of order submission. "
+            "This is the safety wrapper's final check."
+        )
+
+    client = get_client()
+    return client.create_order(**order_kwargs)
+
+
 def _format_error(action: str, error: Exception) -> str:
     """Build a helpful error message instead of a raw traceback."""
     error_str = str(error)
@@ -1095,8 +1124,9 @@ def place_order(
     # the SDK's Pydantic model fails to parse the response, we still
     # log the trade as "submitted" — not "failed".  Only a genuine API
     # error (4xx/5xx, network failure) should be logged as "failed".
-
-    client = get_client()
+    #
+    # All orders go through _safe_create_order() which re-checks the
+    # kill switch as a final safety gate before the API call.
 
     order_kwargs = {
         "ticker": ticker,
@@ -1116,10 +1146,24 @@ def place_order(
         # Market order — no price needed
         order_kwargs["type"] = "market"
 
-    # ── Step 1: Send the order to Kalshi ────────────────────────────
-    # If this fails, the order never reached Kalshi → log as "failed".
+    # ── Step 1: Send the order to Kalshi via safety wrapper ─────────
+    # _safe_create_order() re-checks the kill switch immediately before
+    # the API call, closing any race-condition window.
+    # If the call fails, the order never reached Kalshi → log as "failed".
     try:
-        response = client.create_order(**order_kwargs)
+        response = _safe_create_order(**order_kwargs)
+    except KillSwitchError as ks:
+        # Kill switch was toggled ON between the tool-level check and now
+        _log_trade(
+            ticker=ticker, side=side, action="buy", quantity=quantity,
+            price_cents=limit_price_cents or 0, status="rejected",
+            error_message=str(ks),
+        )
+        return (
+            "🛑 ORDER BLOCKED: Kill switch was enabled between safety "
+            "checks and order submission (race condition caught).\n\n"
+            "No order was sent to Kalshi."
+        )
     except Exception as e:
         _log_trade(
             ticker=ticker, side=side, action="buy", quantity=quantity,
