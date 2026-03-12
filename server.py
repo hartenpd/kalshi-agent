@@ -20,6 +20,7 @@ from mcp.server.fastmcp import FastMCP
 from kalshi_python_sync import Configuration, KalshiClient
 from kalshi_python_sync.models.market import Market as _MarketModel
 from kalshi_python_sync.models.orderbook import Orderbook as _OrderbookModel
+from kalshi_python_sync.models.order import Order as _OrderModel
 
 
 
@@ -99,6 +100,38 @@ def _patched_orderbook_from_dict(cls, obj):
 
 
 _OrderbookModel.from_dict = _patched_orderbook_from_dict
+
+# Patch 3: Order model — the API returns null for several int fields
+# (yes_price, no_price, fill_count, etc.) that the SDK marks as required
+# non-nullable. Default them to 0 so Pydantic doesn't crash.
+_original_order_from_dict = _OrderModel.from_dict.__func__
+
+_ORDER_NUMERIC_DEFAULTS = {
+    "yes_price": 0, "no_price": 0,
+    "fill_count": 0, "remaining_count": 0, "initial_count": 0,
+    "taker_fees": 0, "maker_fees": 0,
+    "taker_fill_cost": 0, "maker_fill_cost": 0,
+    "queue_position": 0,
+}
+_ORDER_STRING_DEFAULTS = {
+    "yes_price_dollars": "0.0000", "no_price_dollars": "0.0000",
+    "taker_fill_cost_dollars": "0.0000", "maker_fill_cost_dollars": "0.0000",
+}
+
+
+@classmethod  # type: ignore[misc]
+def _patched_order_from_dict(cls, obj):
+    if isinstance(obj, dict):
+        for field, default in _ORDER_NUMERIC_DEFAULTS.items():
+            if obj.get(field) is None:
+                obj[field] = default
+        for field, default in _ORDER_STRING_DEFAULTS.items():
+            if obj.get(field) is None:
+                obj[field] = default
+    return _original_order_from_dict(cls, obj)
+
+
+_OrderModel.from_dict = _patched_order_from_dict
 
 
 # ══════════════════════════════════════════════════════════════════════════════
