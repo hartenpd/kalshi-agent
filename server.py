@@ -30,18 +30,47 @@ from kalshi_python_sync.models.orderbook import Orderbook as _OrderbookModel
 # models. We patch from_dict() on each model to fix the data before it hits
 # Pydantic validation, so the SDK doesn't crash.
 
-# Patch 1: Market model — API returns null for 'category' and
-# 'risk_limit_cents', but the SDK marks them as required.
+# Patch 1: Market model — the API now returns dollar-string fields
+# (e.g. yes_bid_dollars: "0.2800") and sends null for the old
+# cent-integer fields (yes_bid, volume, etc.). The SDK marks these
+# as required non-nullable, so we default nulls to 0.
 _original_market_from_dict = _MarketModel.from_dict.__func__
+
+# Fields the SDK expects as non-nullable int or float, but the API
+# now sends as null (replaced by *_dollars / *_fp string equivalents).
+_NUMERIC_DEFAULTS = {
+    "yes_bid": 0, "yes_ask": 0, "no_bid": 0, "no_ask": 0,
+    "last_price": 0, "volume": 0, "volume_24h": 0,
+    "open_interest": 0, "notional_value": 0,
+    "previous_yes_bid": 0, "previous_yes_ask": 0,
+    "previous_price": 0, "liquidity": 0,
+    "risk_limit_cents": 0,
+}
+# String fields the SDK expects as non-nullable str.
+_STRING_DEFAULTS = {
+    "category": "",
+    "yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0000",
+    "no_bid_dollars": "0.0000", "no_ask_dollars": "0.0000",
+    "last_price_dollars": "0.0000",
+    "notional_value_dollars": "0.0000",
+    "previous_yes_bid_dollars": "0.0000",
+    "previous_yes_ask_dollars": "0.0000",
+    "previous_price_dollars": "0.0000",
+    "liquidity_dollars": "0.0000",
+}
 
 
 @classmethod  # type: ignore[misc]
 def _patched_market_from_dict(cls, obj):
     if isinstance(obj, dict):
-        if obj.get("category") is None:
-            obj["category"] = ""
-        if obj.get("risk_limit_cents") is None:
-            obj["risk_limit_cents"] = 0
+        # Default null numeric fields to 0
+        for field, default in _NUMERIC_DEFAULTS.items():
+            if obj.get(field) is None:
+                obj[field] = default
+        # Default null string fields to their safe defaults
+        for field, default in _STRING_DEFAULTS.items():
+            if obj.get(field) is None:
+                obj[field] = default
         # The API returns enum values the SDK doesn't know about.
         # Map unknown values to safe defaults so Pydantic doesn't crash.
         _known_statuses = {"initialized", "active", "closed", "settled", "determined"}
@@ -361,6 +390,32 @@ def _format_error(action: str, error: Exception) -> str:
 mcp = FastMCP("kalshi-agent")
 
 
+def _dollars(market, field: str) -> float:
+    """
+    Read a price/volume from a market, preferring the new dollar-string
+    fields over the deprecated cent-integer fields.
+
+    The Kalshi API migrated from cent integers (yes_bid=28) to dollar
+    strings (yes_bid_dollars="0.2800"). The old fields are now null.
+    This helper reads the dollars field first, falls back to cents / 100.
+    """
+    # Try the _dollars or _fp string field first (these have real data)
+    dollars_field = f"{field}_dollars"
+    fp_field = f"{field}_fp"
+    for attr in (dollars_field, fp_field):
+        val = getattr(market, attr, None)
+        if val is not None:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                pass
+    # Fall back to the cent-integer field (deprecated, usually 0 now)
+    val = getattr(market, field, None)
+    if val is not None:
+        return val / 100
+    return 0.0
+
+
 # ─── Market Discovery ────────────────────────────────────────────────────────
 
 def _fetch_series_markets(client, series_ticker: str) -> list:
@@ -548,9 +603,9 @@ def get_sports_markets(query: str) -> str:
             lines.append(f"  {len(game_markets)} market(s) available\n")
 
             for m in game_markets[:3]:
-                yes_price = (m.yes_bid or 0) / 100
-                no_price = (m.no_bid or 0) / 100
-                volume = m.volume or 0
+                yes_price = _dollars(m, "yes_bid")
+                no_price = _dollars(m, "no_bid")
+                volume = _dollars(m, "volume")
                 close_str = str(m.close_time) if m.close_time else "N/A"
                 title = (
                     m.title if len(m.title) <= 80
@@ -560,7 +615,7 @@ def get_sports_markets(query: str) -> str:
                     f"  Ticker: {m.ticker}\n"
                     f"  Title:  {title}\n"
                     f"  YES: ${yes_price:.2f}  |  NO: ${no_price:.2f}  |  "
-                    f"Vol: {volume:,}  |  Closes: {close_str}\n"
+                    f"Vol: {volume:.0f}  |  Closes: {close_str}\n"
                 )
 
             if len(game_markets) > 3:
@@ -597,11 +652,11 @@ def get_market_details(ticker: str) -> str:
         market_response = client.get_market(ticker=ticker)
         m = market_response.market
 
-        yes_bid = (m.yes_bid or 0) / 100
-        yes_ask = (m.yes_ask or 0) / 100
-        no_bid = (m.no_bid or 0) / 100
-        no_ask = (m.no_ask or 0) / 100
-        last_price = (m.last_price or 0) / 100
+        yes_bid = _dollars(m, "yes_bid")
+        yes_ask = _dollars(m, "yes_ask")
+        no_bid = _dollars(m, "no_bid")
+        no_ask = _dollars(m, "no_ask")
+        last_price = _dollars(m, "last_price")
         close_str = str(m.close_time) if m.close_time else "N/A"
 
         lines = [
@@ -614,9 +669,9 @@ def get_market_details(ticker: str) -> str:
             f"  NO   bid ${no_bid:.2f}  /  ask ${no_ask:.2f}",
             f"  Last traded: ${last_price:.2f}",
             "",
-            f"Volume:         {m.volume or 0:,}",
-            f"24h Volume:     {m.volume_24h or 0:,}",
-            f"Open Interest:  {m.open_interest or 0:,}",
+            f"Volume:         {_dollars(m, 'volume'):.0f}",
+            f"24h Volume:     {_dollars(m, 'volume_24h'):.0f}",
+            f"Open Interest:  {_dollars(m, 'open_interest'):.0f}",
             f"Closes:         {close_str}",
         ]
 
