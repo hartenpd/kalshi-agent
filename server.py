@@ -1705,6 +1705,180 @@ def settle_analyst_pick(pick_id: int, outcome: str) -> str:
 
 
 @mcp.tool()
+def delete_analyst_pick(pick_id: int) -> str:
+    """
+    Delete a pick from the calibration tracker entirely.
+
+    Returns the pick details so you can confirm with the user before
+    calling this tool. Once deleted, the pick cannot be recovered.
+
+    Args:
+        pick_id: ID of the pick to delete (from log_analyst_pick)
+    """
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT * FROM analyst_picks WHERE id = ?", (pick_id,)
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        return f"Error: pick #{pick_id} not found."
+
+    # Build detail string before deleting
+    edge_str = f"{row['edge'] * 100:+.1f}%" if row["edge"] is not None else "N/A"
+    market_str = f"{row['market_price']}¢" if row["market_price"] is not None else "no market"
+    bet_str = f"${row['bet_amount']:.2f}" if row["bet_amount"] else "no bet"
+    pnl_str = f"${row['pnl']:+,.2f}" if row["pnl"] is not None else "N/A"
+
+    conn.execute("DELETE FROM analyst_picks WHERE id = ?", (pick_id,))
+    conn.commit()
+    conn.close()
+
+    return (
+        f"Pick #{pick_id} DELETED.\n\n"
+        f"  Sport:       {row['sport']}\n"
+        f"  Game:        {row['game']}\n"
+        f"  Date:        {row['game_date']}\n"
+        f"  Pick:        {row['pick']}\n"
+        f"  Confidence:  {'★' * row['confidence']}{'☆' * (5 - row['confidence'])}\n"
+        f"  Model prob:  {row['model_probability']:.0%}\n"
+        f"  Market:      {market_str}\n"
+        f"  Edge:        {edge_str}\n"
+        f"  Bet:         {bet_str}\n"
+        f"  Outcome:     {row['outcome']}\n"
+        f"  P&L:         {pnl_str}"
+    )
+
+
+@mcp.tool()
+def edit_analyst_pick(
+    pick_id: int,
+    sport: str | None = None,
+    game: str | None = None,
+    game_date: str | None = None,
+    pick: str | None = None,
+    confidence: int | None = None,
+    model_probability: float | None = None,
+    market_price: int | None = None,
+    edge: float | None = None,
+    bet_placed: bool | None = None,
+    bet_amount: float | None = None,
+    outcome: str | None = None,
+    pnl: float | None = None,
+) -> str:
+    """
+    Update any field on an existing analyst pick.
+
+    Only supply the fields you want to change — everything else stays
+    the same. Useful for correcting typos, fixing a wrong probability,
+    or updating bet details after the fact.
+
+    Args:
+        pick_id: ID of the pick to edit
+        sport: New league name (e.g. 'NBA')
+        game: New matchup description
+        game_date: New game date (e.g. '2026-03-15')
+        pick: New pick value
+        confidence: New confidence 1-5
+        model_probability: New model probability (0-1)
+        market_price: New market price in cents
+        edge: New edge as decimal
+        bet_placed: Whether a bet was placed
+        bet_amount: New bet amount in dollars
+        outcome: New outcome ('pending', 'win', 'loss', 'push')
+        pnl: New P&L value in dollars
+    """
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT * FROM analyst_picks WHERE id = ?", (pick_id,)
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        return f"Error: pick #{pick_id} not found."
+
+    # Validate optional fields
+    if confidence is not None and not (1 <= confidence <= 5):
+        conn.close()
+        return "Error: confidence must be between 1 and 5."
+    if model_probability is not None and not (0 < model_probability < 1):
+        conn.close()
+        return "Error: model_probability must be between 0 and 1."
+    if outcome is not None and outcome.lower().strip() not in (
+        "pending", "win", "loss", "push"
+    ):
+        conn.close()
+        return "Error: outcome must be 'pending', 'win', 'loss', or 'push'."
+
+    # Build SET clause from provided fields only
+    updates = {}
+    if sport is not None:
+        updates["sport"] = sport.upper()
+    if game is not None:
+        updates["game"] = game
+    if game_date is not None:
+        updates["game_date"] = game_date
+    if pick is not None:
+        updates["pick"] = pick
+    if confidence is not None:
+        updates["confidence"] = confidence
+    if model_probability is not None:
+        updates["model_probability"] = model_probability
+    if market_price is not None:
+        updates["market_price"] = market_price
+    if edge is not None:
+        updates["edge"] = edge
+    if bet_placed is not None:
+        updates["bet_placed"] = 1 if bet_placed else 0
+    if bet_amount is not None:
+        updates["bet_amount"] = bet_amount
+    if outcome is not None:
+        updates["outcome"] = outcome.lower().strip()
+    if pnl is not None:
+        updates["pnl"] = pnl
+
+    if not updates:
+        conn.close()
+        return "No fields to update. Supply at least one field to change."
+
+    # Build and execute the UPDATE query
+    set_clause = ", ".join(f"{col} = ?" for col in updates)
+    values = list(updates.values()) + [pick_id]
+    conn.execute(
+        f"UPDATE analyst_picks SET {set_clause} WHERE id = ?", values
+    )
+    conn.commit()
+
+    # Re-read the updated row
+    updated = conn.execute(
+        "SELECT * FROM analyst_picks WHERE id = ?", (pick_id,)
+    ).fetchone()
+    conn.close()
+
+    # Show what changed
+    changed = ", ".join(updates.keys())
+    edge_str = f"{updated['edge'] * 100:+.1f}%" if updated["edge"] is not None else "N/A"
+    market_str = f"{updated['market_price']}¢" if updated["market_price"] is not None else "no market"
+    bet_str = f"${updated['bet_amount']:.2f}" if updated["bet_amount"] else "no bet"
+    pnl_str = f"${updated['pnl']:+,.2f}" if updated["pnl"] is not None else "N/A"
+
+    return (
+        f"Pick #{pick_id} updated. Changed: {changed}\n\n"
+        f"  Sport:       {updated['sport']}\n"
+        f"  Game:        {updated['game']}\n"
+        f"  Date:        {updated['game_date']}\n"
+        f"  Pick:        {updated['pick']}\n"
+        f"  Confidence:  {'★' * updated['confidence']}{'☆' * (5 - updated['confidence'])}\n"
+        f"  Model prob:  {updated['model_probability']:.0%}\n"
+        f"  Market:      {market_str}\n"
+        f"  Edge:        {edge_str}\n"
+        f"  Bet:         {bet_str}\n"
+        f"  Outcome:     {updated['outcome']}\n"
+        f"  P&L:         {pnl_str}"
+    )
+
+
+@mcp.tool()
 def get_calibration_report() -> str:
     """
     Calibration report: how accurate are the analyst's predictions?
