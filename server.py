@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from collections import defaultdict
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+from generate_dashboard import build_dashboard as _build_dashboard, OUTPUT_PATH as _DASHBOARD_PATH
 from kalshi_python_sync import Configuration, KalshiClient
 from kalshi_python_sync.models.market import Market as _MarketModel
 from kalshi_python_sync.models.orderbook import Orderbook as _OrderbookModel
@@ -2451,6 +2452,24 @@ def reconcile_positions() -> str:
 
     except Exception as e:
         return _format_error("reconciling positions", e)
+
+
+# ─── Dashboard ────────────────────────────────────────────────────────────────
+
+@mcp.tool()
+def generate_dashboard() -> str:
+    """
+    Regenerate the Kalshi Agent HTML dashboard from the local database.
+
+    Reads all picks and trades from kalshi_agent.db and writes a fresh
+    dashboard.html with summary stats, calibration tables, methodology
+    comparison, and the full pick log.
+    """
+    try:
+        _build_dashboard()
+        return f"Dashboard updated: {_DASHBOARD_PATH}"
+    except Exception as e:
+        return _format_error("generating dashboard", e)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
