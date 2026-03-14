@@ -323,9 +323,19 @@ def _init_db():
             bet_placed INTEGER NOT NULL DEFAULT 0,  -- 0 or 1
             bet_amount REAL,                  -- dollars, NULL if no bet
             outcome TEXT NOT NULL DEFAULT 'pending', -- 'win', 'loss', 'push', 'pending'
-            pnl REAL                          -- profit/loss in dollars, NULL until settled
+            pnl REAL,                         -- profit/loss in dollars, NULL until settled
+            methodology TEXT NOT NULL DEFAULT 'flat_v1'  -- tracks which model version made this pick
         )
     """)
+
+    # Migration: add methodology column to existing databases that don't have it yet
+    existing_cols = [
+        row[1] for row in cursor.execute("PRAGMA table_info(analyst_picks)").fetchall()
+    ]
+    if "methodology" not in existing_cols:
+        cursor.execute(
+            "ALTER TABLE analyst_picks ADD COLUMN methodology TEXT NOT NULL DEFAULT 'flat_v1'"
+        )
 
     # Kill switch defaults to ON (locked) — safe by default.
     # INSERT OR IGNORE means this only runs on first database creation,
@@ -1468,12 +1478,18 @@ def get_system_status() -> str:
 
 
 @mcp.tool()
-def get_performance_report() -> str:
+def get_performance_report(
+    methodology: str = "market_aware_v1",
+    compare_all: bool = False,
+) -> str:
     """
-    Generate a performance report from the local trade log.
+    Generate a performance report from the local trade log and analyst picks.
 
-    Shows win rate, total P&L, ROI, and trade count.
-    Reads from the local SQLite trades table.
+    Shows trade activity plus analyst pick performance filtered by methodology.
+
+    Args:
+        methodology: Only include analyst picks from this model version (default 'market_aware_v1').
+        compare_all: If True, show analyst pick stats for all methodologies side-by-side.
     """
     conn = _get_db()
 
@@ -1543,6 +1559,62 @@ def get_performance_report() -> str:
             )
             lines.append(f"  {truncated}: {count} trade(s)")
 
+    # ── Analyst Pick Performance ─────────────────────────────────────
+    conn2 = _get_db()
+    if compare_all:
+        pick_rows = conn2.execute(
+            """
+            SELECT * FROM analyst_picks
+            WHERE outcome IN ('win', 'loss', 'push')
+            ORDER BY methodology
+            """
+        ).fetchall()
+    else:
+        pick_rows = conn2.execute(
+            """
+            SELECT * FROM analyst_picks
+            WHERE outcome IN ('win', 'loss', 'push') AND methodology = ?
+            """,
+            (methodology,),
+        ).fetchall()
+    conn2.close()
+
+    if pick_rows:
+        lines.append("\n── Analyst Pick Performance ──")
+
+        if compare_all:
+            # Side-by-side methodology comparison
+            methods: dict[str, list] = defaultdict(list)
+            for r in pick_rows:
+                methods[r["methodology"]].append(r)
+
+            lines.append(
+                f"  {'Methodology':<20} {'Picks':>5}  {'Win%':>5}  {'P&L':>9}"
+            )
+            for method_name in sorted(methods.keys()):
+                m_rows = methods[method_name]
+                m_wins = sum(1 for r in m_rows if r["outcome"] == "win")
+                m_wl = sum(1 for r in m_rows if r["outcome"] in ("win", "loss"))
+                m_wr = m_wins / m_wl if m_wl > 0 else 0
+                m_bets = [r for r in m_rows if r["bet_placed"] and r["pnl"] is not None]
+                m_pnl = sum(r["pnl"] for r in m_bets)
+                lines.append(
+                    f"  {method_name:<20} {len(m_rows):>5}  {m_wr:>5.0%}  ${m_pnl:>+8,.2f}"
+                )
+        else:
+            # Single methodology summary
+            p_wins = sum(1 for r in pick_rows if r["outcome"] == "win")
+            p_wl = sum(1 for r in pick_rows if r["outcome"] in ("win", "loss"))
+            p_wr = p_wins / p_wl if p_wl > 0 else 0
+            p_bets = [r for r in pick_rows if r["bet_placed"] and r["pnl"] is not None]
+            p_pnl = sum(r["pnl"] for r in p_bets)
+            lines.append(
+                f"  Methodology:     {methodology}\n"
+                f"  Settled picks:   {len(pick_rows)}\n"
+                f"  Win rate:        {p_wr:.0%}\n"
+                f"  P&L from bets:   ${p_pnl:+,.2f}"
+            )
+
     return "\n".join(lines)
 
 
@@ -1560,6 +1632,7 @@ def log_analyst_pick(
     edge: float | None = None,
     bet_placed: bool = False,
     bet_amount: float | None = None,
+    methodology: str = "market_aware_v1",
 ) -> str:
     """
     Log a pick from any analyst to the calibration tracker.
@@ -1578,6 +1651,8 @@ def log_analyst_pick(
         edge: Calculated edge as decimal (e.g. 0.15). None if no market.
         bet_placed: Whether we actually placed a trade on this pick
         bet_amount: How much we bet in dollars. None if no bet.
+        methodology: Which model version made this pick (e.g. 'market_aware_v1').
+            Used for A/B tracking between model versions.
 
     Outcome defaults to 'pending' — use settle_analyst_pick after the game.
     """
@@ -1591,8 +1666,8 @@ def log_analyst_pick(
         """
         INSERT INTO analyst_picks
             (sport, game, game_date, pick, confidence, model_probability,
-             market_price, edge, bet_placed, bet_amount, outcome)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+             market_price, edge, bet_placed, bet_amount, outcome, methodology)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
         """,
         (
             sport.upper(),
@@ -1605,6 +1680,7 @@ def log_analyst_pick(
             edge,
             1 if bet_placed else 0,
             bet_amount,
+            methodology,
         ),
     )
     pick_id = cursor.lastrowid
@@ -1626,6 +1702,7 @@ def log_analyst_pick(
         f"  Market:      {market_str}\n"
         f"  Edge:        {edge_str}\n"
         f"  Bet:         {bet_str}\n"
+        f"  Methodology: {methodology}\n"
         f"  Outcome:     pending"
     )
 
@@ -1710,6 +1787,7 @@ def list_analyst_picks(
     sport: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    methodology: str | None = None,
     limit: int = 20,
 ) -> str:
     """
@@ -1722,6 +1800,7 @@ def list_analyst_picks(
         sport: Filter by league — 'NBA', 'MLS', 'EPL', etc. None = all.
         start_date: Only picks on or after this date — '2026-03-01'. None = no lower bound.
         end_date: Only picks on or before this date — '2026-03-14'. None = no upper bound.
+        methodology: Filter by model version — 'flat_v1', 'market_aware_v1', etc. None = all.
         limit: Max picks to return (default 20). Use 0 for all.
     """
     # Validate filters
@@ -1745,6 +1824,9 @@ def list_analyst_picks(
     if end_date is not None:
         clauses.append("game_date <= ?")
         params.append(end_date)
+    if methodology is not None:
+        clauses.append("methodology = ?")
+        params.append(methodology)
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     limit_clause = f"LIMIT {limit}" if limit > 0 else ""
@@ -1769,6 +1851,8 @@ def list_analyst_picks(
         filters.append(f"from {start_date}")
     if end_date:
         filters.append(f"to {end_date}")
+    if methodology:
+        filters.append(f"methodology={methodology}")
     filter_str = f" ({', '.join(filters)})" if filters else ""
 
     lines = [f"Analyst Picks{filter_str} — {len(rows)} result(s)\n"]
@@ -1784,7 +1868,8 @@ def list_analyst_picks(
             f"{row['game']}  →  {row['pick']}\n"
             f"      Confidence: {'★' * row['confidence']}{'☆' * (5 - row['confidence'])}  "
             f"Model: {row['model_probability']:.0%}  Market: {market_str}  Edge: {edge_str}\n"
-            f"      Outcome: {row['outcome']}  Bet: {bet_str}  P&L: {pnl_str}\n"
+            f"      Outcome: {row['outcome']}  Bet: {bet_str}  P&L: {pnl_str}  "
+            f"Method: {row['methodology']}\n"
         )
 
     return "\n".join(lines)
@@ -1827,6 +1912,7 @@ def get_analyst_pick(pick_id: int) -> str:
         f"  Edge:        {edge_str}\n"
         f"  Bet placed:  {'Yes' if row['bet_placed'] else 'No'}\n"
         f"  Bet amount:  {bet_str}\n"
+        f"  Methodology: {row['methodology']}\n"
         f"  Outcome:     {row['outcome']}\n"
         f"  P&L:         {pnl_str}"
     )
@@ -1893,6 +1979,7 @@ def edit_analyst_pick(
     bet_amount: float | None = None,
     outcome: str | None = None,
     pnl: float | None = None,
+    methodology: str | None = None,
 ) -> str:
     """
     Update any field on an existing analyst pick.
@@ -1915,6 +2002,7 @@ def edit_analyst_pick(
         bet_amount: New bet amount in dollars
         outcome: New outcome ('pending', 'win', 'loss', 'push')
         pnl: New P&L value in dollars
+        methodology: Model version tag (e.g. 'flat_v1', 'market_aware_v1')
     """
     conn = _get_db()
     row = conn.execute(
@@ -1964,6 +2052,8 @@ def edit_analyst_pick(
         updates["outcome"] = outcome.lower().strip()
     if pnl is not None:
         updates["pnl"] = pnl
+    if methodology is not None:
+        updates["methodology"] = methodology
 
     if not updates:
         conn.close()
@@ -2001,13 +2091,17 @@ def edit_analyst_pick(
         f"  Market:      {market_str}\n"
         f"  Edge:        {edge_str}\n"
         f"  Bet:         {bet_str}\n"
+        f"  Methodology: {updated['methodology']}\n"
         f"  Outcome:     {updated['outcome']}\n"
         f"  P&L:         {pnl_str}"
     )
 
 
 @mcp.tool()
-def get_calibration_report() -> str:
+def get_calibration_report(
+    methodology: str = "market_aware_v1",
+    compare_all: bool = False,
+) -> str:
     """
     Calibration report: how accurate are the analyst's predictions?
 
@@ -2019,25 +2113,87 @@ def get_calibration_report() -> str:
 
     This is the key tool for improving predictions over time.
     Needs at least a few settled picks to be useful.
+
+    Args:
+        methodology: Only include picks from this model version (default 'market_aware_v1').
+            Lets you evaluate one methodology at a time.
+        compare_all: If True, ignore the methodology filter and show a side-by-side
+            comparison of all methodologies. Useful for A/B testing model versions.
     """
     conn = _get_db()
 
-    # Get all settled picks (not pending)
-    rows = conn.execute(
-        """
-        SELECT * FROM analyst_picks
-        WHERE outcome IN ('win', 'loss', 'push')
-        ORDER BY game_date DESC
-        """
-    ).fetchall()
+    if compare_all:
+        # Fetch all settled picks across all methodologies
+        rows = conn.execute(
+            """
+            SELECT * FROM analyst_picks
+            WHERE outcome IN ('win', 'loss', 'push')
+            ORDER BY game_date DESC
+            """
+        ).fetchall()
+    else:
+        # Filter to a single methodology
+        rows = conn.execute(
+            """
+            SELECT * FROM analyst_picks
+            WHERE outcome IN ('win', 'loss', 'push') AND methodology = ?
+            ORDER BY game_date DESC
+            """,
+            (methodology,),
+        ).fetchall()
     conn.close()
 
     if not rows:
+        if compare_all:
+            return (
+                "No settled picks yet. Use settle_analyst_pick after games "
+                "finish to build calibration data."
+            )
         return (
-            "No settled picks yet. Use settle_analyst_pick after games "
-            "finish to build calibration data."
+            f"No settled picks for methodology '{methodology}'. "
+            f"Try compare_all=True to see all methodologies, or check "
+            f"list_analyst_picks to see what's available."
         )
 
+    # ── If compare_all, show side-by-side methodology comparison ─────
+    if compare_all:
+        methods: dict[str, list] = defaultdict(list)
+        for r in rows:
+            methods[r["methodology"]].append(r)
+
+        lines = ["═══ Calibration Report — All Methodologies ═══\n"]
+        lines.append(
+            f"  {'Methodology':<20} {'Picks':>5}  {'Win%':>5}  "
+            f"{'Avg Model':>10}  {'P&L':>9}  {'ROI':>6}"
+        )
+
+        for method_name in sorted(methods.keys()):
+            m_rows = methods[method_name]
+            m_n = len(m_rows)
+            m_wins = sum(1 for r in m_rows if r["outcome"] == "win")
+            m_wl = sum(1 for r in m_rows if r["outcome"] in ("win", "loss"))
+            m_wr = m_wins / m_wl if m_wl > 0 else 0
+            m_avg_model = sum(r["model_probability"] for r in m_rows) / m_n
+            m_bets = [r for r in m_rows if r["bet_placed"] and r["pnl"] is not None]
+            m_pnl = sum(r["pnl"] for r in m_bets)
+            m_wagered = sum(r["bet_amount"] for r in m_bets if r["bet_amount"])
+            m_roi = (m_pnl / m_wagered * 100) if m_wagered > 0 else 0
+
+            lines.append(
+                f"  {method_name:<20} {m_n:>5}  {m_wr:>5.0%}  "
+                f"{m_avg_model:>10.0%}  ${m_pnl:>+8,.2f}  {m_roi:>+5.1f}%"
+            )
+
+        lines.append(
+            f"\nTotal settled picks across all methodologies: {len(rows)}"
+        )
+        lines.append(
+            "\nRun get_calibration_report(methodology='<name>') for a "
+            "detailed breakdown of a specific methodology."
+        )
+        return "\n".join(lines)
+
+    # ── Single-methodology detailed report ───────────────────────────
     total = len(rows)
     wins = sum(1 for r in rows if r["outcome"] == "win")
     losses = sum(1 for r in rows if r["outcome"] == "loss")
@@ -2051,7 +2207,7 @@ def get_calibration_report() -> str:
     roi = (total_pnl / total_wagered * 100) if total_wagered > 0 else 0
 
     lines = [
-        "═══ Calibration Report ═══\n",
+        f"═══ Calibration Report — {methodology} ═══\n",
         f"Total settled picks:  {total}  ({wins}W / {losses}L / {pushes}P)",
         f"Overall win rate:     {win_rate:.0%}",
     ]
