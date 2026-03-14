@@ -1705,6 +1705,134 @@ def settle_analyst_pick(pick_id: int, outcome: str) -> str:
 
 
 @mcp.tool()
+def list_analyst_picks(
+    status: str | None = None,
+    sport: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 20,
+) -> str:
+    """
+    List analyst picks with optional filters, newest first.
+
+    Read-only — just viewing, no changes.
+
+    Args:
+        status: Filter by outcome — 'pending', 'win', 'loss', or 'push'. None = all.
+        sport: Filter by league — 'NBA', 'MLS', 'EPL', etc. None = all.
+        start_date: Only picks on or after this date — '2026-03-01'. None = no lower bound.
+        end_date: Only picks on or before this date — '2026-03-14'. None = no upper bound.
+        limit: Max picks to return (default 20). Use 0 for all.
+    """
+    # Validate filters
+    if status is not None:
+        status = status.lower().strip()
+        if status not in ("pending", "win", "loss", "push"):
+            return "Error: status must be 'pending', 'win', 'loss', or 'push'."
+
+    clauses = []
+    params: list = []
+
+    if status is not None:
+        clauses.append("outcome = ?")
+        params.append(status)
+    if sport is not None:
+        clauses.append("sport = ?")
+        params.append(sport.upper())
+    if start_date is not None:
+        clauses.append("game_date >= ?")
+        params.append(start_date)
+    if end_date is not None:
+        clauses.append("game_date <= ?")
+        params.append(end_date)
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    limit_clause = f"LIMIT {limit}" if limit > 0 else ""
+
+    conn = _get_db()
+    rows = conn.execute(
+        f"SELECT * FROM analyst_picks {where} ORDER BY game_date DESC, id DESC {limit_clause}",
+        params,
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        return "No picks found matching those filters."
+
+    # Build header showing active filters
+    filters = []
+    if status:
+        filters.append(f"status={status}")
+    if sport:
+        filters.append(f"sport={sport.upper()}")
+    if start_date:
+        filters.append(f"from {start_date}")
+    if end_date:
+        filters.append(f"to {end_date}")
+    filter_str = f" ({', '.join(filters)})" if filters else ""
+
+    lines = [f"Analyst Picks{filter_str} — {len(rows)} result(s)\n"]
+
+    for row in rows:
+        edge_str = f"{row['edge'] * 100:+.1f}%" if row["edge"] is not None else "N/A"
+        market_str = f"{row['market_price']}¢" if row["market_price"] is not None else "no market"
+        bet_str = f"${row['bet_amount']:.2f}" if row["bet_amount"] else "no bet"
+        pnl_str = f"${row['pnl']:+,.2f}" if row["pnl"] is not None else "N/A"
+
+        lines.append(
+            f"  #{row['id']}  {row['game_date']}  [{row['sport']}]  "
+            f"{row['game']}  →  {row['pick']}\n"
+            f"      Confidence: {'★' * row['confidence']}{'☆' * (5 - row['confidence'])}  "
+            f"Model: {row['model_probability']:.0%}  Market: {market_str}  Edge: {edge_str}\n"
+            f"      Outcome: {row['outcome']}  Bet: {bet_str}  P&L: {pnl_str}\n"
+        )
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_analyst_pick(pick_id: int) -> str:
+    """
+    Get full details for a single analyst pick by ID.
+
+    Read-only — just viewing, no changes.
+
+    Args:
+        pick_id: ID of the pick to view (from log_analyst_pick)
+    """
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT * FROM analyst_picks WHERE id = ?", (pick_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        return f"Error: pick #{pick_id} not found."
+
+    edge_str = f"{row['edge'] * 100:+.1f}%" if row["edge"] is not None else "N/A"
+    market_str = f"{row['market_price']}¢" if row["market_price"] is not None else "no market"
+    bet_str = f"${row['bet_amount']:.2f}" if row["bet_amount"] else "no bet"
+    pnl_str = f"${row['pnl']:+,.2f}" if row["pnl"] is not None else "N/A"
+
+    return (
+        f"Pick #{row['id']}\n\n"
+        f"  Logged:      {row['timestamp']}\n"
+        f"  Sport:       {row['sport']}\n"
+        f"  Game:        {row['game']}\n"
+        f"  Date:        {row['game_date']}\n"
+        f"  Pick:        {row['pick']}\n"
+        f"  Confidence:  {'★' * row['confidence']}{'☆' * (5 - row['confidence'])}\n"
+        f"  Model prob:  {row['model_probability']:.0%}\n"
+        f"  Market:      {market_str}\n"
+        f"  Edge:        {edge_str}\n"
+        f"  Bet placed:  {'Yes' if row['bet_placed'] else 'No'}\n"
+        f"  Bet amount:  {bet_str}\n"
+        f"  Outcome:     {row['outcome']}\n"
+        f"  P&L:         {pnl_str}"
+    )
+
+
+@mcp.tool()
 def delete_analyst_pick(pick_id: int) -> str:
     """
     Delete a pick from the calibration tracker entirely.
