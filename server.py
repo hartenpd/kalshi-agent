@@ -54,6 +54,7 @@ _NUMERIC_DEFAULTS = {
 # String fields the SDK expects as non-nullable str.
 _STRING_DEFAULTS = {
     "category": "",
+    "subtitle": "",
     "yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0000",
     "no_bid_dollars": "0.0000", "no_ask_dollars": "0.0000",
     "last_price_dollars": "0.0000",
