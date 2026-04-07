@@ -18,9 +18,18 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "kalshi_agent.db")
 OUTPUT_PATH = os.path.join(os.path.dirname(__file__), "dashboard.html")
 
 # Methodology display config: label, CSS class suffix, active flag
+# Order matters — active first, then retired in reverse chronological order
 METHODOLOGIES = {
+    "market_aware_v2": {"label": "Market-Aware v2", "tag_class": "meth-v2", "active": True},
+    "market_aware_v1": {"label": "Market-Aware v1", "tag_class": "meth-market", "active": False},
     "flat_v1": {"label": "Flat", "tag_class": "meth-flat", "active": False},
-    "market_aware_v1": {"label": "Market-Aware", "tag_class": "meth-market", "active": True},
+}
+
+# Sport-specific delta values applied in v2 (for display in the sport breakdown)
+V2_SPORT_DELTAS = {
+    "NBA": 0.0,
+    "EPL": -0.02,
+    "MLS": -0.01,
 }
 
 
@@ -127,13 +136,29 @@ def _compute_calibration(pick_list):
     # Avg edge accuracy: how close model prob was to actual outcome
     avg_edge_accuracy = None
     if edge_picks:
-        # For each pick, edge accuracy = how close edge predicted the outcome
-        # Use average absolute edge as a proxy
         avg_edge_accuracy = round(
             sum(abs(p["edge"]) for p in edge_picks) / len(edge_picks) * 100, 1
         )
 
     return cal_by_conf, edge_analysis, avg_edge_accuracy
+
+
+def _bucket_win_rate(picks, min_threshold=10):
+    """Compute win rate for a bucket, returning None if below threshold."""
+    settled = [p for p in picks if p["outcome"] in ("win", "loss")]
+    n = len(settled)
+    if n == 0:
+        return {"n": 0, "wins": 0, "win_rate": None, "sufficient": False}
+    wins = sum(1 for p in settled if p["outcome"] == "win")
+    bets = [p for p in settled if p["bet_placed"] and p["pnl"] is not None]
+    pnl = sum(p["pnl"] for p in bets) if bets else 0
+    return {
+        "n": n,
+        "wins": wins,
+        "win_rate": round(wins / n * 100, 1),
+        "pnl": round(pnl, 2),
+        "sufficient": n >= min_threshold,
+    }
 
 
 def build_dashboard():
@@ -166,6 +191,7 @@ def build_dashboard():
 
     meth_stats = {}
     meth_calibrations = {}
+    meth_date_ranges = {}
     for meth_key in METHODOLOGIES:
         meth_picks = meth_groups.get(meth_key, [])
         meth_stats[meth_key] = _compute_stats(meth_picks)
@@ -175,6 +201,60 @@ def build_dashboard():
             "edge_analysis": edge_anal,
             "avg_edge_accuracy": avg_edge,
         }
+        # Date range for each methodology
+        dates = [p["game_date"] for p in meth_picks if p["game_date"]]
+        if dates:
+            meth_date_ranges[meth_key] = {
+                "first": min(dates),
+                "last": max(dates),
+            }
+        else:
+            meth_date_ranges[meth_key] = {"first": None, "last": None}
+
+    # ── v1 vs v2 comparison buckets ───────────────────────────────────
+    v1_picks = meth_groups.get("market_aware_v1", [])
+    v2_picks = meth_groups.get("market_aware_v2", [])
+
+    v1v2_comparison = {
+        # 4-star picks: did tightening the threshold help?
+        "four_star": {
+            "v1": _bucket_win_rate([p for p in v1_picks if p["confidence"] == 4]),
+            "v2": _bucket_win_rate([p for p in v2_picks if p["confidence"] == 4]),
+        },
+        # EPL: did shrinking deltas reduce losses?
+        "epl": {
+            "v1": _bucket_win_rate([p for p in v1_picks if p["sport"] == "EPL"]),
+            "v2": _bucket_win_rate([p for p in v2_picks if p["sport"] == "EPL"]),
+        },
+        # NBA 3-star: did it stay stable as expected?
+        "nba_3star": {
+            "v1": _bucket_win_rate([p for p in v1_picks if p["sport"] == "NBA" and p["confidence"] == 3]),
+            "v2": _bucket_win_rate([p for p in v2_picks if p["sport"] == "NBA" and p["confidence"] == 3]),
+        },
+    }
+
+    # ── v2 per-sport breakdown ────────────────────────────────────────
+    v2_settled = [p for p in v2_picks if p["outcome"] in ("win", "loss")]
+    v2_sport_groups = defaultdict(list)
+    for p in v2_settled:
+        v2_sport_groups[p["sport"]].append(p)
+
+    v2_sport_breakdown = []
+    for sport in sorted(v2_sport_groups.keys()):
+        rows = v2_sport_groups[sport]
+        n = len(rows)
+        wins = sum(1 for p in rows if p["outcome"] == "win")
+        bets = [p for p in rows if p["bet_placed"] and p["pnl"] is not None]
+        pnl = sum(p["pnl"] for p in bets)
+        delta = V2_SPORT_DELTAS.get(sport, 0.0)
+        v2_sport_breakdown.append({
+            "sport": sport,
+            "n": n,
+            "wins": wins,
+            "win_rate": round(wins / n * 100, 1) if n else 0,
+            "pnl": round(pnl, 2),
+            "delta": delta,
+        })
 
     # ── Overall calibration (combined) ────────────────────────────────
     overall_cal_conf, overall_edge, _ = _compute_calibration(picks)
@@ -230,11 +310,14 @@ def build_dashboard():
         worst_trade=worst_trade,
         meth_stats=meth_stats,
         meth_calibrations=meth_calibrations,
+        meth_date_ranges=meth_date_ranges,
         overall_cal_conf=overall_cal_conf,
         overall_edge=overall_edge,
         cal_by_sport=cal_by_sport,
         pick_rows=pick_rows,
         generated_at=generated_at,
+        v1v2_comparison=v1v2_comparison,
+        v2_sport_breakdown=v2_sport_breakdown,
     )
 
     with open(OUTPUT_PATH, "w") as f:
@@ -263,25 +346,36 @@ def _build_html(**data):
     roi_sign = "+" if overall["roi"] >= 0 else ""
 
     # ── Methodology summary cards HTML ────────────────────────────────
+    # Active methodology shown first and prominently, retired ones dimmed
     meth_cards_html = ""
     for meth_key, meta in METHODOLOGIES.items():
         s = data["meth_stats"].get(meth_key, _compute_stats([]))
         is_active = meta["active"]
-        # Active methodology gets a blue left border; retired gets dimmed
-        border_style = "border-left: 3px solid #3b82f6;" if is_active else "border-left: 3px solid #475569; opacity: 0.7;"
+        date_range = data["meth_date_ranges"].get(meth_key, {})
+        date_str = ""
+        if date_range.get("first") and date_range.get("last"):
+            date_str = f'{date_range["first"]} — {date_range["last"]}'
+
+        if is_active:
+            border_style = "border-left: 3px solid #22c55e;"
+        else:
+            border_style = "border-left: 3px solid #475569; opacity: 0.7;"
         status_label = "ACTIVE" if is_active else "RETIRED"
-        status_color = "#3b82f6" if is_active else "#64748b"
+        status_color = "#22c55e" if is_active else "#64748b"
         tag_class = meta["tag_class"]
 
         m_pnl_color = "#4ade80" if s["total_pnl"] >= 0 else "#f87171"
         m_pnl_sign = "+" if s["total_pnl"] >= 0 else ""
         m_roi_sign = "+" if s["roi"] >= 0 else ""
 
+        date_html = f'<span style="color: #64748b; font-size: 0.7rem;">{date_str}</span>' if date_str else ""
+
         meth_cards_html += f"""
   <div class="meth-row" style="{border_style}">
     <div class="meth-header">
       <span class="badge {tag_class}">{meta["label"]}</span>
       <span style="color: {status_color}; font-size: 0.7rem; font-weight: 600; letter-spacing: 0.05em;">{status_label}</span>
+      {date_html}
     </div>
     <div class="meth-stats">
       <div class="meth-stat">
@@ -308,8 +402,6 @@ def _build_html(**data):
     meth_cal_sections = ""
     for meth_key, meta in METHODOLOGIES.items():
         cal_data = data["meth_calibrations"].get(meth_key, {})
-        cal_conf = cal_data.get("cal_by_conf", [])
-        edge_anal = cal_data.get("edge_analysis", [])
         is_active = meta["active"]
         status_text = "(active)" if is_active else "(retired)"
         section_opacity = "" if is_active else "opacity: 0.75;"
@@ -355,6 +447,8 @@ def _build_html(**data):
     # Serialize data for JS
     cal_sport_json = json.dumps(data["cal_by_sport"])
     picks_json = json.dumps(data["pick_rows"])
+    v1v2_json = json.dumps(data["v1v2_comparison"])
+    v2_sport_json = json.dumps(data["v2_sport_breakdown"])
 
     # Per-methodology calibration data for JS
     meth_cal_js_blocks = ""
@@ -375,18 +469,22 @@ renderEdge(document.getElementById('{edge_id}'), {edge_json});
     for meth_key, meta in METHODOLOGIES.items():
         s = data["meth_stats"].get(meth_key, _compute_stats([]))
         cal_data = data["meth_calibrations"].get(meth_key, {})
+        dr = data["meth_date_ranges"].get(meth_key, {})
         comparison_rows.append({
             "key": meth_key,
             "label": meta["label"],
             "tag_class": meta["tag_class"],
             "active": meta["active"],
             "settled": s["settled"],
+            "total": s["total"],
             "win_rate": s["win_rate"],
             "roi": s["roi"],
             "avg_bet": s["avg_bet"],
             "avg_edge": cal_data.get("avg_edge_accuracy"),
             "total_pnl": s["total_pnl"],
             "sufficient": s["settled"] >= min_picks_threshold,
+            "first_date": dr.get("first"),
+            "last_date": dr.get("last"),
         })
     comparison_json = json.dumps(comparison_rows)
 
@@ -570,9 +668,10 @@ tr:hover td {{
 .badge-warn {{ background: #713f12; color: #facc15; }}
 .badge-bad {{ background: #7f1d1d; color: #f87171; }}
 
-/* Methodology badges */
+/* Methodology badges — gray for flat, blue for v1, green for v2 */
 .meth-flat {{ background: #374151; color: #9ca3af; }}
 .meth-market {{ background: #1e3a5f; color: #60a5fa; }}
+.meth-v2 {{ background: #14532d; color: #4ade80; }}
 
 /* Stars */
 .stars {{ color: #f59e0b; letter-spacing: 1px; }}
@@ -581,10 +680,10 @@ tr:hover td {{
 .edge-positive {{ color: #4ade80; }}
 .edge-negative {{ color: #f87171; }}
 
-/* Comparison section */
+/* Comparison section — 3 columns for 3 methodologies */
 .compare-grid {{
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: 16px;
   margin: 16px 0;
 }}
@@ -624,11 +723,97 @@ tr:hover td {{
   font-size: 0.85rem;
 }}
 
+/* v1 vs v2 comparison table */
+.v1v2-grid {{
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0;
+  margin: 16px 0;
+}}
+.v1v2-row {{
+  display: grid;
+  grid-template-columns: 200px 1fr 1fr 120px;
+  gap: 0;
+  border-bottom: 1px solid #1e293b;
+  align-items: center;
+}}
+.v1v2-row.header {{
+  border-bottom: 1px solid #2d3348;
+}}
+.v1v2-cell {{
+  padding: 10px 14px;
+  font-size: 0.85rem;
+}}
+.v1v2-cell.header {{
+  color: #94a3b8;
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: #1a1d2e;
+}}
+.v1v2-cell.metric-label {{
+  color: #94a3b8;
+  font-weight: 500;
+}}
+.v1v2-cell.value {{
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}}
+
+/* v2 sport breakdown */
+.sport-grid {{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+  margin: 16px 0;
+}}
+.sport-card {{
+  background: #1a1d2e;
+  border: 1px solid #2d3348;
+  border-radius: 10px;
+  padding: 14px 18px;
+  border-left: 3px solid #22c55e;
+}}
+.sport-card-title {{
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #f8fafc;
+  margin-bottom: 8px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}}
+.sport-card-delta {{
+  font-size: 0.72rem;
+  color: #64748b;
+  font-weight: 400;
+}}
+.sport-card-stat {{
+  display: flex;
+  justify-content: space-between;
+  padding: 3px 0;
+  font-size: 0.82rem;
+}}
+.sport-card-stat-label {{
+  color: #94a3b8;
+}}
+.sport-card-stat-value {{
+  font-weight: 600;
+  color: #f8fafc;
+  font-variant-numeric: tabular-nums;
+}}
+
 /* Responsive */
+@media (max-width: 900px) {{
+  .compare-grid {{ grid-template-columns: 1fr; }}
+  .v1v2-row {{ grid-template-columns: 140px 1fr 1fr 100px; }}
+}}
 @media (max-width: 640px) {{
   body {{ padding: 12px; }}
   .cards {{ grid-template-columns: 1fr 1fr; }}
   .compare-grid {{ grid-template-columns: 1fr; }}
+  .v1v2-row {{ grid-template-columns: 1fr 1fr 1fr 1fr; font-size: 0.78rem; }}
   table {{ font-size: 0.78rem; }}
   td, th {{ padding: 6px 8px; }}
 }}
@@ -672,8 +857,19 @@ tr:hover td {{
 {meth_cards_html}
 </div>
 
+<!-- ═══ v1 vs v2 Comparison ═══ -->
+<h2>v1 vs v2 — Did the Changes Help?</h2>
+<p class="subtitle" style="margin-bottom: 12px; margin-top: -8px;">
+  v2 changes: sport-specific edge deltas, tighter 4-star confidence threshold
+</p>
+<div id="v1v2-section"></div>
+
+<!-- ═══ v2 Sport Breakdown ═══ -->
+<h2><span class="badge meth-v2">v2</span> Performance by Sport</h2>
+<div id="v2-sport-section"></div>
+
 <!-- ═══ Calibration by Sport (overall) ═══ -->
-<h2>Calibration by Sport</h2>
+<h2>Calibration by Sport (All Methodologies)</h2>
 <table>
 <thead>
   <tr>
@@ -725,11 +921,14 @@ tr:hover td {{
 const calSport = {cal_sport_json};
 const picksData = {picks_json};
 const comparisonData = {comparison_json};
+const v1v2Data = {v1v2_json};
+const v2SportData = {v2_sport_json};
 
 // ── Methodology badge helper ──
 const METH_CONFIG = {{
   'flat_v1': {{ label: 'FLAT', cls: 'meth-flat' }},
-  'market_aware_v1': {{ label: 'MARKET-AWARE', cls: 'meth-market' }},
+  'market_aware_v1': {{ label: 'V1', cls: 'meth-market' }},
+  'market_aware_v2': {{ label: 'V2', cls: 'meth-v2' }},
 }};
 function methBadge(key) {{
   const cfg = METH_CONFIG[key] || {{ label: key, cls: 'meth-flat' }};
@@ -781,8 +980,100 @@ function renderEdge(tbody, data) {{
   }});
 }}
 
+// Helper: render a win rate value, or "insufficient data" with count
+function wrCell(bucket, cls) {{
+  if (!bucket || bucket.n === 0) return '<span class="insufficient">No data</span>';
+  if (!bucket.sufficient) return `<span class="insufficient">${{bucket.win_rate}}% (${{bucket.n}} picks \u2014 need 10)</span>`;
+  const pnlStr = bucket.pnl !== undefined ? ` / ${{bucket.pnl >= 0 ? '+' : ''}}$${{Math.abs(bucket.pnl).toFixed(2)}}` : '';
+  return `<span class="${{cls}}" style="font-weight:600">${{bucket.win_rate}}%</span> <span style="color:#64748b;font-size:0.78rem">(${{bucket.n}} picks${{pnlStr}})</span>`;
+}}
+
+// Compute a simple delta string between two win rates
+function deltaStr(v1, v2) {{
+  if (!v1 || !v2 || !v1.sufficient || !v2.sufficient) return '\u2014';
+  const diff = v2.win_rate - v1.win_rate;
+  const sign = diff >= 0 ? '+' : '';
+  const cls = diff > 0 ? 'win' : diff < 0 ? 'loss' : '';
+  return `<span class="${{cls}}" style="font-weight:600">${{sign}}${{diff.toFixed(1)}}%</span>`;
+}}
+
 // ── Render per-methodology calibration tables ──
 {meth_cal_js_blocks}
+
+// ── v1 vs v2 Comparison ──
+const v1v2Section = document.getElementById('v1v2-section');
+const v1v2Rows = [
+  {{
+    label: '4-Star Picks',
+    question: 'Did tightening the threshold help?',
+    v1: v1v2Data.four_star.v1,
+    v2: v1v2Data.four_star.v2,
+  }},
+  {{
+    label: 'EPL Overall',
+    question: 'Did shrinking deltas reduce losses?',
+    v1: v1v2Data.epl.v1,
+    v2: v1v2Data.epl.v2,
+  }},
+  {{
+    label: 'NBA 3-Star',
+    question: 'Did it stay stable as expected?',
+    v1: v1v2Data.nba_3star.v1,
+    v2: v1v2Data.nba_3star.v2,
+  }},
+];
+
+let v1v2Html = `
+<div class="v1v2-grid">
+  <div class="v1v2-row header">
+    <div class="v1v2-cell header">Metric</div>
+    <div class="v1v2-cell header" style="text-align:right">` + methBadge('market_aware_v1') + `</div>
+    <div class="v1v2-cell header" style="text-align:right">` + methBadge('market_aware_v2') + `</div>
+    <div class="v1v2-cell header" style="text-align:right">Delta</div>
+  </div>`;
+
+v1v2Rows.forEach(row => {{
+  v1v2Html += `
+  <div class="v1v2-row">
+    <div class="v1v2-cell metric-label">
+      ${{row.label}}
+      <div style="font-size:0.72rem;color:#475569;font-weight:400;margin-top:2px">${{row.question}}</div>
+    </div>
+    <div class="v1v2-cell value">${{wrCell(row.v1, 'meth-market')}}</div>
+    <div class="v1v2-cell value">${{wrCell(row.v2, 'meth-v2')}}</div>
+    <div class="v1v2-cell value">${{deltaStr(row.v1, row.v2)}}</div>
+  </div>`;
+}});
+
+v1v2Html += '</div>';
+v1v2Section.innerHTML = v1v2Html;
+
+// ── v2 Sport Breakdown ──
+const v2SportSection = document.getElementById('v2-sport-section');
+if (!v2SportData.length) {{
+  v2SportSection.innerHTML = '<p class="insufficient">No settled v2 picks yet</p>';
+}} else {{
+  let sportHtml = '<div class="sport-grid">';
+  v2SportData.forEach(s => {{
+    const wrClass = s.win_rate >= 50 ? 'win' : s.win_rate > 0 ? 'loss' : '';
+    const pnlClass = s.pnl >= 0 ? 'win' : 'loss';
+    const pnlSign = s.pnl >= 0 ? '+' : '';
+    const deltaStr = s.delta !== 0 ? (s.delta > 0 ? '+' : '') + (s.delta * 100).toFixed(0) + '% delta' : 'no delta';
+    sportHtml += `
+    <div class="sport-card">
+      <div class="sport-card-title">
+        ${{s.sport}}
+        <span class="sport-card-delta">${{deltaStr}}</span>
+      </div>
+      <div class="sport-card-stat"><span class="sport-card-stat-label">Picks</span><span class="sport-card-stat-value">${{s.n}} settled</span></div>
+      <div class="sport-card-stat"><span class="sport-card-stat-label">Win Rate</span><span class="sport-card-stat-value ${{wrClass}}">${{s.win_rate}}%</span></div>
+      <div class="sport-card-stat"><span class="sport-card-stat-label">Record</span><span class="sport-card-stat-value">${{s.wins}}W / ${{s.n - s.wins}}L</span></div>
+      <div class="sport-card-stat"><span class="sport-card-stat-label">P&L</span><span class="sport-card-stat-value ${{pnlClass}}">${{pnlSign}}$${{Math.abs(s.pnl).toFixed(2)}}</span></div>
+    </div>`;
+  }});
+  sportHtml += '</div>';
+  v2SportSection.innerHTML = sportHtml;
+}}
 
 // ── Calibration by Sport ──
 const sportBody = document.getElementById('cal-sport-body');
@@ -828,48 +1119,27 @@ picksData.forEach(r => {{
   </tr>`;
 }});
 
-// ── Methodology Comparison ──
+// ── Methodology Comparison (3 columns with date ranges) ──
 const compSection = document.getElementById('comparison-section');
-const allSufficient = comparisonData.every(m => m.sufficient);
-
-if (!allSufficient) {{
-  // Show which methodologies lack data
-  let msg = comparisonData
-    .filter(m => !m.sufficient)
-    .map(m => `${{m.label}}: ${{m.settled}} settled picks`)
-    .join(', ');
-  compSection.innerHTML = `
-    <div class="compare-grid">
-      ${{comparisonData.map(m => `
-        <div class="compare-card" style="border-left: 3px solid ${{m.active ? '#3b82f6' : '#475569'}};">
-          <h3><span class="badge ${{m.tag_class}}">${{m.label}}</span> ${{m.active ? '(active)' : '(retired)'}}</h3>
-          ${{m.sufficient ? `
-            <div class="compare-metric"><span class="compare-metric-label">Win Rate</span><span class="compare-metric-value">${{m.win_rate}}%</span></div>
-            <div class="compare-metric"><span class="compare-metric-label">ROI</span><span class="compare-metric-value">${{m.roi >= 0 ? '+' : ''}}${{m.roi}}%</span></div>
-            <div class="compare-metric"><span class="compare-metric-label">Avg Bet Size</span><span class="compare-metric-value">$${{m.avg_bet.toFixed(2)}}</span></div>
-            <div class="compare-metric"><span class="compare-metric-label">Avg Edge</span><span class="compare-metric-value">${{m.avg_edge !== null ? m.avg_edge + '%' : '\u2014'}}</span></div>
-            <div class="compare-metric"><span class="compare-metric-label">Total P&L</span><span class="compare-metric-value ${{m.total_pnl >= 0 ? 'win' : 'loss'}}">${{m.total_pnl >= 0 ? '+' : ''}}$${{Math.abs(m.total_pnl).toFixed(2)}}</span></div>
-          ` : `
-            <p class="insufficient">Insufficient data \u2014 ${{m.settled}} of 10 settled picks needed</p>
-          `}}
-        </div>
-      `).join('')}}
-    </div>`;
-}} else {{
-  compSection.innerHTML = `
-    <div class="compare-grid">
-      ${{comparisonData.map(m => `
-        <div class="compare-card" style="border-left: 3px solid ${{m.active ? '#3b82f6' : '#475569'}};">
-          <h3><span class="badge ${{m.tag_class}}">${{m.label}}</span> ${{m.active ? '(active)' : '(retired)'}}</h3>
+compSection.innerHTML = `
+  <div class="compare-grid">
+    ${{comparisonData.map(m => `
+      <div class="compare-card" style="border-left: 3px solid ${{m.active ? '#22c55e' : '#475569'}}; ${{m.active ? '' : 'opacity: 0.8;'}}">
+        <h3><span class="badge ${{m.tag_class}}">${{m.label}}</span> ${{m.active ? '(active)' : '(retired)'}}</h3>
+        ${{m.first_date ? `<div style="font-size:0.72rem;color:#475569;margin-bottom:10px">${{m.first_date}} \u2014 ${{m.last_date}}</div>` : ''}}
+        ${{m.sufficient ? `
+          <div class="compare-metric"><span class="compare-metric-label">Picks</span><span class="compare-metric-value">${{m.total}} (${{m.settled}} settled)</span></div>
           <div class="compare-metric"><span class="compare-metric-label">Win Rate</span><span class="compare-metric-value">${{m.win_rate}}%</span></div>
           <div class="compare-metric"><span class="compare-metric-label">ROI</span><span class="compare-metric-value">${{m.roi >= 0 ? '+' : ''}}${{m.roi}}%</span></div>
           <div class="compare-metric"><span class="compare-metric-label">Avg Bet Size</span><span class="compare-metric-value">$${{m.avg_bet.toFixed(2)}}</span></div>
           <div class="compare-metric"><span class="compare-metric-label">Avg Edge</span><span class="compare-metric-value">${{m.avg_edge !== null ? m.avg_edge + '%' : '\u2014'}}</span></div>
           <div class="compare-metric"><span class="compare-metric-label">Total P&L</span><span class="compare-metric-value ${{m.total_pnl >= 0 ? 'win' : 'loss'}}">${{m.total_pnl >= 0 ? '+' : ''}}$${{Math.abs(m.total_pnl).toFixed(2)}}</span></div>
-        </div>
-      `).join('')}}
-    </div>`;
-}}
+        ` : `
+          <p class="insufficient">Insufficient data \u2014 ${{m.settled}} of 10 settled picks needed</p>
+        `}}
+      </div>
+    `).join('')}}
+  </div>`;
 </script>
 </body>
 </html>"""
