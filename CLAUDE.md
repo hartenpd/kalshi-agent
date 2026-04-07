@@ -42,7 +42,7 @@ KALSHI_ENV=demo
 
 Read `KALSHI_ENV` from `.env` to choose which one. Default to **demo**.
 
-## MCP Tools (20 total)
+## MCP Tools (21 total)
 
 ### Market Discovery
 - **get_sports_markets** — search for sports markets by team, player, or league name (NBA, MLS, EPL, etc.)
@@ -70,6 +70,9 @@ Read `KALSHI_ENV` from `.env` to choose which one. Default to **demo**.
 - **delete_analyst_pick** — permanently delete a pick by ID
 - **edit_analyst_pick** — update any field(s) on an existing pick
 - **get_calibration_report** — predicted vs actual win rates by confidence level and sport, edge accuracy
+
+### Dashboard
+- **generate_dashboard** — regenerate dashboard.html from the database with stats, calibration, and pick log
 
 ### System / Risk Management
 - **toggle_kill_switch** — toggle trading on/off (defaults ON, auto-enables on daily loss limit breach)
@@ -147,6 +150,20 @@ Each patch monkey-patches `from_dict()` on the affected model class to default n
 
 6. **Fill** (`_patched_fill_from_dict`) — defaults 4 null int fields (`count`, `price`, `yes_price`, `no_price`) to `0` and 2 fixed-price string fields to `"0.0000"`.
 
+## Methodologies
+
+Each analyst pick is tagged with a `methodology` string that identifies the model version used. This lets us A/B test different approaches and track calibration per methodology.
+
+| Key | Status | Description |
+|---|---|---|
+| `flat_v1` | Retired | Original flat-probability model, no market price awareness |
+| `market_aware_v1` | Retired | Added market price comparison and edge calculation |
+| `market_aware_v2` | **Active** | Sport-specific edge deltas (different thresholds per sport) and a tighter 4-star confidence threshold |
+
+The `log_analyst_pick` tool accepts any methodology string — new picks should use `"market_aware_v2"`. The `get_calibration_report` tool can filter by methodology or compare all side-by-side with `compare_all=True`.
+
+**Note:** The `METHODOLOGIES` dict in `generate_dashboard.py` controls which methodologies appear on the HTML dashboard. Update it when adding new methodologies.
+
 ## Key Learnings & Gotchas
 
 ### Market discovery
@@ -173,7 +190,7 @@ Each patch monkey-patches `from_dict()` on the affected model class to default n
 
 | File | Description |
 |---|---|
-| `server.py` | Main FastMCP server — all 20 MCP tools, SDK patches, DB setup, Kalshi client |
+| `server.py` | Main FastMCP server — all 21 MCP tools, SDK patches, DB setup, Kalshi client |
 | `generate_dashboard.py` | Reads `kalshi_agent.db` and produces `dashboard.html` with calibration charts and pick log |
 | `main.py` | Default entry point stub (unused — server runs via `server.py`) |
 | `test_connection.py` | Verifies API credentials work by fetching account balance |
