@@ -129,26 +129,34 @@ pnl               REAL                       -- profit/loss in dollars, NULL unt
 
 ## SDK Pydantic Compatibility Patches
 
-**DO NOT REMOVE THESE PATCHES.** They are in `server.py` lines 30-218.
+**DO NOT REMOVE THESE PATCHES.** They are in `server.py`, in the "SDK COMPATIBILITY PATCHES" block near the top of the file.
 
 ### Why they exist
-Kalshi migrated their API from cent-integer fields (e.g. `yes_bid: 28`) to dollar-string fields (e.g. `yes_bid_dollars: "0.2800"`). The old cent fields now return `null`. But the `kalshi_python_sync` SDK's Pydantic models still mark these old fields as required and non-nullable. Without patches, every API call crashes with a Pydantic `ValidationError`.
+Kalshi migrated their API from cent-integer fields (e.g. `yes_bid: 28`) to dollar-string fields (e.g. `yes_bid_dollars: "0.2800"`). The old cent fields first started returning `null`, and now are **omitted from the JSON entirely**. The `kalshi_python_sync` SDK's Pydantic models still mark them as required and non-nullable. Without patches, every API call crashes with a Pydantic `ValidationError`.
 
 Each patch monkey-patches `from_dict()` on the affected model class to default null fields to `0` (ints) or `"0.0000"` (strings) before Pydantic validation runs.
 
+**Why `from_dict()` and not just model defaults:** the SDK's generated `from_dict()` passes `obj.get("field")` for every field, so an absent key arrives as an explicit `None` and shadows any default on the model. Relaxing the model is necessary but not sufficient — both layers are required.
+
 ### Patched models
 
-1. **Market** (`_patched_market_from_dict`) — defaults 14 numeric fields (`yes_bid`, `no_bid`, `volume`, `open_interest`, etc.) to `0` and 10 dollar-string fields to `"0.0000"`. Also maps unknown `status` enum values to `"settled"` and unknown `result` values to `""`.
+1. **Market** — two layers, both driven by the single `_MARKET_FIELD_DEFAULTS` dict so they can't drift apart:
+   - `_relax_model_fields()` rewrites the Pydantic model at import time, making every non-guaranteed field `Optional` with a sensible default. Only `ticker`, `event_ticker`, `title` and `status` stay required (`_MARKET_REQUIRED_FIELDS`) — those are the fields we key markets on, so a market missing one really is unusable. It also wraps the generator's `must be one of enum values` validators to tolerate `None`, since those run in `mode="after"` and would otherwise still reject a null on a now-Optional field. This is done in `server.py` rather than by editing `site-packages`, which any `uv sync` would silently undo.
+   - `_patched_market_from_dict()` materialises those defaults before validation, and maps unknown `status`/`result`/`market_type` enum values to safe ones.
 
-2. **Orderbook** (`_patched_orderbook_from_dict`) — the API returns `yes_dollars`/`no_dollars` arrays where quantity is an int, but the SDK expects `List[List[StrictStr]]`. Patch converts all values to strings.
+   As of 2026-08 the live API omits 18 required fields on every sports market, including `response_price_units` and `tick_size`, which have no `*_dollars` successor.
 
-3. **Order** (`_patched_order_from_dict`) — defaults 10 null int fields (`yes_price`, `no_price`, `fill_count`, `remaining_count`, etc.) to `0` and 4 dollar-string fields to `"0.0000"`.
+2. **GetMarketsResponse** (`_patched_get_markets_from_dict`) — the generated model builds its markets with a list comprehension, so one unparseable market raised and took the whole page of up to 200 with it. This patch parses them one at a time, skipping and logging the bad ones instead of aborting the request.
 
-4. **MarketPosition** (`_patched_position_from_dict`) — defaults 6 null int fields (`total_traded`, `position`, `market_exposure`, etc.) to `0` and 4 dollar-string fields to `"0.0000"`.
+3. **Orderbook** (`_patched_orderbook_from_dict`) — the API returns `yes_dollars`/`no_dollars` arrays where quantity is an int, but the SDK expects `List[List[StrictStr]]`. Patch converts all values to strings.
 
-5. **EventPosition** (`_patched_event_position_from_dict`) — defaults 5 null int fields (`total_cost`, `event_exposure`, etc.) to `0` and 4 dollar-string fields to `"0.0000"`.
+4. **Order** (`_patched_order_from_dict`) — defaults 10 null int fields (`yes_price`, `no_price`, `fill_count`, `remaining_count`, etc.) to `0` and 4 dollar-string fields to `"0.0000"`.
 
-6. **Fill** (`_patched_fill_from_dict`) — defaults 4 null int fields (`count`, `price`, `yes_price`, `no_price`) to `0` and 2 fixed-price string fields to `"0.0000"`.
+5. **MarketPosition** (`_patched_position_from_dict`) — defaults 6 null int fields (`total_traded`, `position`, `market_exposure`, etc.) to `0` and 4 dollar-string fields to `"0.0000"`.
+
+6. **EventPosition** (`_patched_event_position_from_dict`) — defaults 5 null int fields (`total_cost`, `event_exposure`, etc.) to `0` and 4 dollar-string fields to `"0.0000"`.
+
+7. **Fill** (`_patched_fill_from_dict`) — defaults 4 null int fields (`count`, `price`, `yes_price`, `no_price`) to `0` and 2 fixed-price string fields to `"0.0000"`.
 
 ## Methodologies
 
@@ -171,6 +179,9 @@ The `log_analyst_pick` tool accepts any methodology string — new picks should 
 - Ticker format: `KXNBAGAME-26MAR12DALMEM-MEM` (series, date+teams code, pick side).
 - Market close times are set ~2 weeks after the actual game date. **Filter by `status="open"`, not by date.** Date filtering breaks everything.
 - The `_dollars()` helper reads dollar-string fields first, falls back to deprecated cent fields. Always use it instead of accessing market attributes directly.
+- **Kalshi names MLB and NBA markets by city, never by nickname** — the Yankees trade as "New York Y wins", so a text search for "Yankees" matches nothing. `_TEAM_NICKNAMES` maps nicknames to the per-series ticker code, and `_matches_nickname()` matches against the codes embedded in the ticker. Keyed by series ticker because nicknames collide across sports (the Giants are `SF` in MLB but `NYG` in the NFL). EPL/MLS/UCL use club names and the NFL already embeds the nickname, so those leagues need no aliases.
+- **Never swallow a failed series fetch.** `except Exception: pass` around `_fetch_series_markets` made an API/parse error indistinguishable from a league with no games, so real errors surfaced to the user as "No open markets found". Collect failures and report them.
+- Run with `KALSHI_LOG_LEVEL=DEBUG` to log raw per-page market counts and cursors from every Kalshi call. Logging goes to **stderr** — MCP uses stdout for JSON-RPC, so anything printed to stdout corrupts the protocol stream.
 
 ### Trading safety
 - **Kill switch defaults to ON.** Must be explicitly toggled off before any trades go through.

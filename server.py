@@ -10,9 +10,13 @@ Trade history and system state stored in local SQLite (kalshi_agent.db).
 """
 
 import os
+import re
+import sys
 import math
+import logging
 import sqlite3
 import certifi
+from typing import Optional
 from datetime import datetime, timezone
 from collections import defaultdict
 from dotenv import load_dotenv
@@ -20,12 +24,31 @@ from mcp.server.fastmcp import FastMCP
 from generate_dashboard import build_dashboard as _build_dashboard, OUTPUT_PATH as _DASHBOARD_PATH
 from kalshi_python_sync import Configuration, KalshiClient
 from kalshi_python_sync.models.market import Market as _MarketModel
+from kalshi_python_sync.models.get_markets_response import (
+    GetMarketsResponse as _GetMarketsResponseModel,
+)
 from kalshi_python_sync.models.orderbook import Orderbook as _OrderbookModel
 from kalshi_python_sync.models.order import Order as _OrderModel
 from kalshi_python_sync.models.market_position import MarketPosition as _MarketPositionModel
 from kalshi_python_sync.models.event_position import EventPosition as _EventPositionModel
 from kalshi_python_sync.models.fill import Fill as _FillModel
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ═════════════════════════════════════════════════════════════════════════════
+# MCP talks JSON-RPC over stdout, so every log line MUST go to stderr or it
+# corrupts the protocol stream. Raise the volume for debugging with:
+#   KALSHI_LOG_LEVEL=DEBUG uv run server.py
+# DEBUG prints the raw per-page market counts from every Kalshi API call,
+# which is how you tell an genuinely empty response apart from a swallowed error.
+
+logging.basicConfig(
+    level=os.getenv("KALSHI_LOG_LEVEL", "WARNING").upper(),
+    stream=sys.stderr,
+    format="%(levelname)s [%(name)s] %(message)s",
+)
+logger = logging.getLogger("kalshi_agent")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -35,26 +58,63 @@ from kalshi_python_sync.models.fill import Fill as _FillModel
 # models. We patch from_dict() on each model to fix the data before it hits
 # Pydantic validation, so the SDK doesn't crash.
 
-# Patch 1: Market model — the API now returns dollar-string fields
-# (e.g. yes_bid_dollars: "0.2800") and sends null for the old
-# cent-integer fields (yes_bid, volume, etc.). The SDK marks these
-# as required non-nullable, so we default nulls to 0.
+# Patch 1: Market model — the API omits fields the SDK marks as required.
+#
+# Kalshi migrated cent-integer fields (yes_bid: 28) to dollar strings
+# (yes_bid_dollars: "0.2800"). The current production API doesn't just send
+# null for the old fields, it leaves them out of the JSON entirely — 18 of
+# the SDK's required fields are absent from every live sports market, most
+# recently including `response_price_units` and `tick_size`, which have no
+# dollar-string successor to fall back on.
+#
+# We defend in two layers, both driven by _MARKET_FIELD_DEFAULTS below so the
+# two can never drift apart:
+#
+#   1. _relax_market_model() rewrites the Pydantic model itself, turning every
+#      non-guaranteed field into Optional with a sensible default. This is the
+#      real fix: one missing field can no longer invalidate a whole market.
+#
+#   2. _patched_market_from_dict() fills those defaults in before validation.
+#      This layer is still necessary because the SDK's generated from_dict()
+#      passes obj.get("field") for every single field — force-feeding an
+#      explicit None where the key is absent, which would override the model
+#      defaults from layer 1 on its own.
+
 _original_market_from_dict = _MarketModel.from_dict.__func__
 
-# Fields the SDK expects as non-nullable int or float, but the API
-# now sends as null (replaced by *_dollars / *_fp string equivalents).
-_NUMERIC_DEFAULTS = {
+# Audited against the live production API on 2026-08-24 by sampling 333 open
+# markets across all seven sports series. Only these four fields were present
+# on every market AND are what we key markets on downstream, so they stay
+# required — if one of them is missing, the market really is unusable.
+_MARKET_REQUIRED_FIELDS = {"ticker", "event_ticker", "title", "status"}
+
+# Everything else, with the value to substitute when the API omits or nulls it.
+# `None` means "leave it as None" — used for timestamps and nested objects,
+# where no placeholder would be more honest than the absence itself.
+_MARKET_FIELD_DEFAULTS = {
+    # --- Descriptive text: "" keeps len()/lower() calls downstream safe -----
+    "subtitle": "",
+    "yes_sub_title": "",
+    "no_sub_title": "",
+    "category": "",
+    "expiration_value": "",
+    "rules_primary": "",
+    "rules_secondary": "",
+    "price_level_structure": "",
+    # --- Enum-constrained fields (see validator handling below) ------------
+    "market_type": "binary",
+    "result": "",
+    "response_price_units": "usd_cent",   # omitted by the API as of 2026-08
+    # --- Deprecated cent-integer fields, superseded by *_dollars / *_fp -----
     "yes_bid": 0, "yes_ask": 0, "no_bid": 0, "no_ask": 0,
     "last_price": 0, "volume": 0, "volume_24h": 0,
     "open_interest": 0, "notional_value": 0,
     "previous_yes_bid": 0, "previous_yes_ask": 0,
     "previous_price": 0, "liquidity": 0,
     "risk_limit_cents": 0,
-}
-# String fields the SDK expects as non-nullable str.
-_STRING_DEFAULTS = {
-    "category": "",
-    "subtitle": "",
+    "settlement_timer_seconds": 0,
+    "tick_size": 1,                       # omitted by the API as of 2026-08
+    # --- Dollar-string fields: present today, but cheap to guard ------------
     "yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0000",
     "no_bid_dollars": "0.0000", "no_ask_dollars": "0.0000",
     "last_price_dollars": "0.0000",
@@ -63,19 +123,95 @@ _STRING_DEFAULTS = {
     "previous_yes_ask_dollars": "0.0000",
     "previous_price_dollars": "0.0000",
     "liquidity_dollars": "0.0000",
+    # --- Flags --------------------------------------------------------------
+    "can_close_early": False,
+    # --- Timestamps and nested objects: absence is better than a fake value.
+    # Every read site in this file already guards these with `if m.close_time`.
+    "created_time": None,
+    "open_time": None,
+    "close_time": None,
+    "expiration_time": None,
+    "latest_expiration_time": None,
+    "price_ranges": None,
 }
+
+
+def _relax_model_fields(model, defaults: dict, expected_required: set) -> None:
+    """
+    Make the named fields Optional-with-a-default on a Pydantic v2 model.
+
+    The Kalshi SDK's models are code-generated from an OpenAPI spec that the
+    live API has drifted away from, so fields the spec calls required simply
+    aren't sent any more. Rather than vendor-editing site-packages (which any
+    `uv sync` would silently undo), we relax the model in place at import time.
+
+    Two things have to happen for a field to genuinely become optional:
+      - the annotation becomes Optional[...] and a default is attached, and
+      - any "must be one of enum values" validator the generator attached is
+        wrapped, because those run in mode="after" — i.e. after type
+        validation — so they would still reject a None on an Optional field.
+    """
+    for name, default in defaults.items():
+        field = model.model_fields.get(name)
+        if field is None:
+            continue  # This SDK version doesn't have the field; nothing to do.
+        field.annotation = Optional[field.annotation]
+        field.default = default
+        field.default_factory = None
+
+    for decorator in model.__pydantic_decorators__.field_validators.values():
+        target = next(
+            (f for f in decorator.info.fields if f in defaults), None
+        )
+        if target is None:
+            continue
+        original_validator = decorator.func
+
+        # decorator.func is the already-class-bound validator, so the
+        # replacement takes just the value. Pydantic inspects this signature
+        # to decide whether to pass a ValidationInfo second argument — keep
+        # it single-argument to match what the generator produced.
+        def _none_tolerant(value, _orig=original_validator,
+                           _default=defaults[target]):
+            # A relaxed field can now legitimately hold None; substitute the
+            # default rather than raising "must be one of enum values".
+            if value is None:
+                return _default
+            return _orig(value)
+
+        decorator.func = _none_tolerant
+
+    # Rebuild so Pydantic regenerates its core schema from the edited fields.
+    model.model_rebuild(force=True)
+
+    # Warn if the SDK grew a required field we haven't accounted for. Without
+    # this, an SDK upgrade (or another API change) silently reintroduces the
+    # exact failure mode this patch exists to prevent, and the symptom shows
+    # up as an unrelated-looking "no markets found".
+    still_required = {
+        name for name, field in model.model_fields.items() if field.is_required()
+    }
+    unexpected = still_required - expected_required
+    if unexpected:
+        logger.warning(
+            "%s has required field(s) not covered by the compatibility patch: "
+            "%s. If the Kalshi API stops sending one of these, market parsing "
+            "will fail — add it to _MARKET_FIELD_DEFAULTS.",
+            model.__name__, ", ".join(sorted(unexpected)),
+        )
+
+
+_relax_model_fields(_MarketModel, _MARKET_FIELD_DEFAULTS, _MARKET_REQUIRED_FIELDS)
 
 
 @classmethod  # type: ignore[misc]
 def _patched_market_from_dict(cls, obj):
     if isinstance(obj, dict):
-        # Default null numeric fields to 0
-        for field, default in _NUMERIC_DEFAULTS.items():
-            if obj.get(field) is None:
-                obj[field] = default
-        # Default null string fields to their safe defaults
-        for field, default in _STRING_DEFAULTS.items():
-            if obj.get(field) is None:
+        # The SDK's from_dict passes obj.get(field) for every field, so an
+        # absent key arrives as an explicit None and shadows the model
+        # default. Materialise the defaults here so that can't happen.
+        for field, default in _MARKET_FIELD_DEFAULTS.items():
+            if default is not None and obj.get(field) is None:
                 obj[field] = default
         # The API returns enum values the SDK doesn't know about.
         # Map unknown values to safe defaults so Pydantic doesn't crash.
@@ -85,10 +221,64 @@ def _patched_market_from_dict(cls, obj):
         _known_results = {"yes", "no", ""}
         if obj.get("result") is not None and obj["result"] not in _known_results:
             obj["result"] = ""
+        _known_market_types = {"binary", "scalar"}
+        if obj.get("market_type") not in _known_market_types:
+            obj["market_type"] = "binary"
     return _original_market_from_dict(cls, obj)
 
 
 _MarketModel.from_dict = _patched_market_from_dict
+
+
+# Patch 1b: GetMarketsResponse — isolate per-market parse failures.
+#
+# The generated response model builds its markets with a list comprehension:
+#     [Market.from_dict(item) for item in obj["markets"]]
+# so a single unparseable market raises and takes the entire page of up to 200
+# markets with it — which is what turned one nullable field into "no markets
+# found" for a whole search. Parse them one at a time instead, and skip and log
+# the bad ones rather than aborting the request.
+
+_original_get_markets_from_dict = _GetMarketsResponseModel.from_dict.__func__
+
+
+@classmethod  # type: ignore[misc]
+def _patched_get_markets_from_dict(cls, obj):
+    if isinstance(obj, dict) and isinstance(obj.get("markets"), list):
+        raw_markets = obj["markets"]
+        parsed = []
+        skipped = 0
+        for raw in raw_markets:
+            try:
+                market = _MarketModel.from_dict(raw)
+            except Exception as exc:
+                skipped += 1
+                ticker = raw.get("ticker") if isinstance(raw, dict) else None
+                logger.warning(
+                    "Skipping unparseable market %s: %s: %s",
+                    ticker or "<no ticker>", type(exc).__name__, exc,
+                )
+                logger.debug("Raw payload for skipped market: %r", raw)
+                continue
+            if market is not None:
+                parsed.append(market)
+
+        if skipped:
+            logger.warning(
+                "Skipped %d of %d market(s) in this page; returning the other %d.",
+                skipped, len(raw_markets), len(parsed),
+            )
+
+        # Build the response with an empty market list, then attach the
+        # markets we successfully parsed above.
+        response = _original_get_markets_from_dict(cls, {**obj, "markets": []})
+        if response is not None:
+            response.markets = parsed
+        return response
+    return _original_get_markets_from_dict(cls, obj)
+
+
+_GetMarketsResponseModel.from_dict = _patched_get_markets_from_dict
 
 # Patch 2: Orderbook model — API returns quantity as int (e.g. 3250) but
 # the SDK expects List[List[StrictStr]] (both price and qty as strings).
@@ -257,6 +447,89 @@ SPORTS_SERIES = {
     "KXMLBGAME": "MLB",
     "KXNFLGAME": "NFL",
     "KXUCLGAME": "UCL",
+}
+
+# Team nicknames → Kalshi's per-series team code.
+#
+# Kalshi names MLB and NBA markets by city, never by nickname: the Yankees
+# trade as "New York Y wins" under ticker code NYY, so a plain text search for
+# "Yankees" matches nothing at all. EPL, MLS and UCL use club names (Arsenal,
+# Liverpool) and NFL already embeds the nickname ("BUF Bills"), so those
+# leagues need no aliases and aren't listed here.
+#
+# Keyed by series ticker rather than a bare code because nicknames collide
+# across sports — the Giants are SF in MLB but NYG in the NFL, and an
+# unscoped "SF" would wrongly match the NFL's 49ers.
+#
+# MLB codes are verified against the live API. NBA codes are the standard
+# league abbreviations; only BOS/DET/NYK/OKC/PHI/SAS appear in the preseason
+# markets available today, so the rest are unverified until the season opens.
+_TEAM_NICKNAMES = {
+    # --- MLB -----------------------------------------------------------------
+    "diamondbacks": {"KXMLBGAME": "AZ"}, "dbacks": {"KXMLBGAME": "AZ"},
+    "braves": {"KXMLBGAME": "ATL"},
+    "orioles": {"KXMLBGAME": "BAL"},
+    "red sox": {"KXMLBGAME": "BOS"}, "redsox": {"KXMLBGAME": "BOS"},
+    "cubs": {"KXMLBGAME": "CHC"},
+    "white sox": {"KXMLBGAME": "CWS"}, "whitesox": {"KXMLBGAME": "CWS"},
+    "reds": {"KXMLBGAME": "CIN"},
+    "guardians": {"KXMLBGAME": "CLE"},
+    "rockies": {"KXMLBGAME": "COL"},
+    "tigers": {"KXMLBGAME": "DET"},
+    "astros": {"KXMLBGAME": "HOU"},
+    "royals": {"KXMLBGAME": "KC"},
+    "angels": {"KXMLBGAME": "LAA"},
+    "dodgers": {"KXMLBGAME": "LAD"},
+    "marlins": {"KXMLBGAME": "MIA"},
+    "brewers": {"KXMLBGAME": "MIL"},
+    "twins": {"KXMLBGAME": "MIN"},
+    "mets": {"KXMLBGAME": "NYM"},
+    "yankees": {"KXMLBGAME": "NYY"},
+    "athletics": {"KXMLBGAME": "ATH"}, "a's": {"KXMLBGAME": "ATH"},
+    "phillies": {"KXMLBGAME": "PHI"},
+    "pirates": {"KXMLBGAME": "PIT"},
+    "padres": {"KXMLBGAME": "SD"},
+    "mariners": {"KXMLBGAME": "SEA"},
+    "rays": {"KXMLBGAME": "TB"},
+    "blue jays": {"KXMLBGAME": "TOR"}, "bluejays": {"KXMLBGAME": "TOR"},
+    "nationals": {"KXMLBGAME": "WSH"},
+    # --- NBA -----------------------------------------------------------------
+    "hawks": {"KXNBAGAME": "ATL"},
+    "celtics": {"KXNBAGAME": "BOS"},
+    "nets": {"KXNBAGAME": "BKN"},
+    "hornets": {"KXNBAGAME": "CHA"},
+    "bulls": {"KXNBAGAME": "CHI"},
+    "cavaliers": {"KXNBAGAME": "CLE"}, "cavs": {"KXNBAGAME": "CLE"},
+    "mavericks": {"KXNBAGAME": "DAL"}, "mavs": {"KXNBAGAME": "DAL"},
+    "nuggets": {"KXNBAGAME": "DEN"},
+    "pistons": {"KXNBAGAME": "DET"},
+    "warriors": {"KXNBAGAME": "GSW"},
+    "rockets": {"KXNBAGAME": "HOU"},
+    "pacers": {"KXNBAGAME": "IND"},
+    "clippers": {"KXNBAGAME": "LAC"},
+    "lakers": {"KXNBAGAME": "LAL"},
+    "grizzlies": {"KXNBAGAME": "MEM"},
+    "heat": {"KXNBAGAME": "MIA"},
+    "bucks": {"KXNBAGAME": "MIL"},
+    "timberwolves": {"KXNBAGAME": "MIN"}, "wolves": {"KXNBAGAME": "MIN"},
+    "pelicans": {"KXNBAGAME": "NOP"},
+    "knicks": {"KXNBAGAME": "NYK"},
+    "thunder": {"KXNBAGAME": "OKC"},
+    "magic": {"KXNBAGAME": "ORL"},
+    "76ers": {"KXNBAGAME": "PHI"}, "sixers": {"KXNBAGAME": "PHI"},
+    "suns": {"KXNBAGAME": "PHX"},
+    "trail blazers": {"KXNBAGAME": "POR"}, "blazers": {"KXNBAGAME": "POR"},
+    "spurs": {"KXNBAGAME": "SAS"},
+    "raptors": {"KXNBAGAME": "TOR"},
+    "jazz": {"KXNBAGAME": "UTA"},
+    "wizards": {"KXNBAGAME": "WAS"},
+    # --- Nicknames shared across leagues -------------------------------------
+    "cardinals": {"KXMLBGAME": "STL", "KXNFLGAME": "ARI"},
+    "giants": {"KXMLBGAME": "SF", "KXNFLGAME": "NYG"},
+    "rangers": {"KXMLBGAME": "TEX", "KXNHLGAME": "NYR"},
+    "kings": {"KXNBAGAME": "SAC", "KXNHLGAME": "LAK"},
+    "jets": {"KXNFLGAME": "NYJ", "KXNHLGAME": "WPG"},
+    "panthers": {"KXNFLGAME": "CAR", "KXNHLGAME": "FLA"},
 }
 
 
@@ -577,10 +850,16 @@ def _dollars(market, field: str) -> float:
 # ─── Market Discovery ────────────────────────────────────────────────────────
 
 def _fetch_series_markets(client, series_ticker: str) -> list:
-    """Fetch all open markets for a given series ticker, paginating."""
+    """
+    Fetch all open markets for a given series ticker, paginating.
+
+    Raises on API/parse failure rather than returning an empty list — callers
+    need to be able to tell "this league has no games today" apart from "the
+    request blew up", which is exactly the distinction that used to be lost.
+    """
     all_markets = []
     cursor = None
-    for _ in range(5):
+    for page in range(5):
         kwargs = {
             "series_ticker": series_ticker,
             "status": "open",
@@ -589,11 +868,65 @@ def _fetch_series_markets(client, series_ticker: str) -> list:
         if cursor:
             kwargs["cursor"] = cursor
         resp = client.get_markets(**kwargs)
+        # Run with KALSHI_LOG_LEVEL=DEBUG to see the raw shape of what the API
+        # actually returned for each page.
+        logger.debug(
+            "get_markets(series_ticker=%s, page=%d) -> %d market(s), cursor=%r",
+            series_ticker, page, len(resp.markets or []), resp.cursor,
+        )
+        if page == 0 and not resp.markets:
+            logger.debug("Raw first-page response for %s: %r", series_ticker, resp)
         all_markets.extend(resp.markets)
         cursor = resp.cursor
         if not cursor:
             break
+    logger.debug("series %s: %d open market(s) total", series_ticker, len(all_markets))
     return all_markets
+
+
+def _ticker_team_codes(ticker: str) -> tuple[str, str] | None:
+    """
+    Pull the two team codes out of a game ticker.
+
+    Tickers look like KXMLBGAME-26AUG271905HOUNYY-NYY: series, then a matchup
+    segment of date (+ optional start time) followed by the two team codes
+    run together, then the side being priced. Strip the leading date/time
+    digits and the concatenated codes are what's left ("HOUNYY").
+    """
+    parts = ticker.split("-")
+    if len(parts) < 2:
+        return None
+    matched = re.match(r"^\d{2}[A-Z]{3}\d+", parts[1])
+    if not matched:
+        return None
+    return parts[0], parts[1][matched.end():]
+
+
+def _matches_nickname(market, nickname_codes: dict) -> bool:
+    """True if this market's ticker names a team the nickname maps to."""
+    codes = _ticker_team_codes(market.ticker or "")
+    if codes is None:
+        return False
+    series_ticker, teams = codes
+    code = nickname_codes.get(series_ticker)
+    if not code:
+        return False
+    # `teams` is the two codes concatenated, so the team we want is either
+    # the first or the second — anchor to the ends rather than doing a loose
+    # substring check, which would let a short code match mid-string.
+    return teams.startswith(code) or teams.endswith(code)
+
+
+def _market_matches_query(market, query_lower: str, nickname_codes: dict) -> bool:
+    """Text-match a market, falling back to nickname → team-code matching."""
+    haystacks = (
+        market.title, market.subtitle,
+        market.yes_sub_title, market.no_sub_title,
+        market.event_ticker, market.ticker,
+    )
+    if any(query_lower in (field or "").lower() for field in haystacks):
+        return True
+    return bool(nickname_codes) and _matches_nickname(market, nickname_codes)
 
 
 def _resolve_query_to_series(query: str) -> list[str]:
@@ -611,6 +944,13 @@ def _resolve_query_to_series(query: str) -> list[str]:
         if q == league:
             return [series_ticker]
 
+    # A known nickname tells us exactly which league(s) to ask about, which
+    # both cuts the API calls and avoids matching a same-named team in
+    # another sport.
+    nickname_codes = _TEAM_NICKNAMES.get(query.lower().strip())
+    if nickname_codes:
+        return [st for st in nickname_codes if st in SPORTS_SERIES]
+
     # Return all series for team/player text search
     return list(SPORTS_SERIES.keys())
 
@@ -620,8 +960,12 @@ def get_sports_markets(query: str) -> str:
     """
     Search for available sports prediction markets on Kalshi.
 
-    Search by team name (e.g. 'Charlotte', 'Denver', 'Arsenal'), player name
-    (e.g. 'Jokic', 'Harden'), or game terms (e.g. 'Over', 'goals', 'Points').
+    Search by team name (e.g. 'Charlotte', 'Denver', 'Arsenal'), team nickname
+    (e.g. 'Yankees', 'Dodgers', 'Celtics'), player name (e.g. 'Jokic',
+    'Harden'), or game terms (e.g. 'Over', 'goals', 'Points').
+
+    Kalshi names MLB and NBA markets by city ("New York Y wins"), so nicknames
+    are resolved to the team's ticker code before matching.
 
     You can also search by league name to get all upcoming games:
       NBA, MLS, NHL, EPL, MLB, NFL, UCL
@@ -636,6 +980,7 @@ def get_sports_markets(query: str) -> str:
 
         target_series = _resolve_query_to_series(query)
         query_lower = query.lower()
+        nickname_codes = _TEAM_NICKNAMES.get(query_lower.strip(), {})
         is_league_query = query.upper().strip() in SPORTS_SERIES.values()
 
         # Step 1: Fetch open markets from the targeted series.
@@ -644,12 +989,19 @@ def get_sports_markets(query: str) -> str:
         # The status="open" filter in _fetch_series_markets already
         # limits results to active/tradeable markets only.
         series_markets = []
+        series_errors = []
         for series_ticker in target_series:
             try:
                 markets = _fetch_series_markets(client, series_ticker)
                 series_markets.extend(markets)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Previously `except Exception: pass`, which made a failing
+                # request indistinguishable from a league with no games — so
+                # a parse error surfaced as "No open markets found". Keep
+                # going (one bad league shouldn't sink a cross-league search)
+                # but hold on to the error so it can be reported below.
+                logger.exception("Fetching series %s failed", series_ticker)
+                series_errors.append((series_ticker, exc))
 
         # Step 2: For non-league queries, also search the general market
         # list (catches parlays and other market types like KXMVE).
@@ -668,10 +1020,7 @@ def get_sports_markets(query: str) -> str:
                     break
             general_matches = [
                 m for m in general_markets
-                if query_lower in (m.title or "").lower()
-                or query_lower in (m.subtitle or "").lower()
-                or query_lower in (m.event_ticker or "").lower()
-                or query_lower in (m.ticker or "").lower()
+                if _market_matches_query(m, query_lower, nickname_codes)
             ]
 
         # Step 4: Combine and filter results.
@@ -682,10 +1031,7 @@ def get_sports_markets(query: str) -> str:
             # Text-filter series markets, then add general matches
             filtered_series = [
                 m for m in series_markets
-                if query_lower in (m.title or "").lower()
-                or query_lower in (m.subtitle or "").lower()
-                or query_lower in (m.event_ticker or "").lower()
-                or query_lower in (m.ticker or "").lower()
+                if _market_matches_query(m, query_lower, nickname_codes)
             ]
             matches = filtered_series + general_matches
 
@@ -699,6 +1045,21 @@ def get_sports_markets(query: str) -> str:
         matches = unique_matches
 
         if not matches:
+            # An empty result set with failed requests behind it is an error,
+            # not an answer. Report the real cause instead of pretending the
+            # league simply has no games.
+            if series_errors:
+                detail = "\n".join(
+                    f"  - {ticker}: {type(exc).__name__}: {exc}"
+                    for ticker, exc in series_errors
+                )
+                return (
+                    f"Could not complete the search for '{query}' — "
+                    f"{len(series_errors)} of {len(target_series)} series "
+                    f"request(s) failed, so this is an API/parsing error "
+                    f"rather than an empty market list:\n{detail}"
+                )
+
             leagues = ", ".join(SPORTS_SERIES.values())
             return (
                 f"No open markets found matching '{query}'.\n\n"
@@ -787,6 +1148,16 @@ def get_sports_markets(query: str) -> str:
                 f"\n... plus {total_games - 15} more games. "
                 f"Use a more specific search to narrow down."
             )
+
+        # Results came back, but not from everywhere we asked — say so, so a
+        # partial answer never reads as a complete one.
+        if series_errors:
+            lines.append(
+                "\nWarning: these results are incomplete. "
+                f"{len(series_errors)} series request(s) failed:"
+            )
+            for ticker, exc in series_errors:
+                lines.append(f"  - {ticker}: {type(exc).__name__}: {exc}")
 
         return "\n".join(lines)
 
